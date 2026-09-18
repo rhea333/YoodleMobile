@@ -1,0 +1,240 @@
+import type { ProfileRow, ProfileUpdate, Uuid } from '../types/database';
+import { supabase } from './supabase';
+
+/**
+ * Profile reads and writes. Like every other Supabase call in the app, these
+ * live in /src/services and are never inlined into a component.
+ *
+ * Note on the postal code: callers write the FULL code and read back only
+ * `postal_fsa`. That asymmetry is enforced by the database (migration 0008
+ * revokes column-level SELECT on `postal_code`), not by convention here.
+ */
+
+/** Columns a client is actually permitted to read. Keep in sync with 0008. */
+const PROFILE_COLUMNS = 'id, display_name, avatar_url, postal_fsa, bio, created_at, updated_at';
+
+export const AVATAR_BUCKET = 'avatars';
+
+/**
+ * Upload limits, enforced here BEFORE any bytes leave the device.
+ *
+ * Storage enforces the same ceiling and MIME allow-list server-side (see
+ * migration 0009), so a client that bypasses this still cannot abuse the
+ * bucket. This copy exists to fail fast and to give a usable error message
+ * instead of a rejected multipart upload.
+ */
+export const MAX_AVATAR_BYTES = 5 * 1024 * 1024;
+export const ALLOWED_AVATAR_MIME_TYPES = [
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/heic',
+] as const;
+
+export type AllowedAvatarMimeType = (typeof ALLOWED_AVATAR_MIME_TYPES)[number];
+
+/** The subset of an expo-image-picker asset this service needs. */
+export interface PickedImage {
+  uri: string;
+  mimeType?: string;
+  fileSize?: number;
+  fileName?: string;
+}
+
+export interface AvatarValidationFailure {
+  ok: false;
+  message: string;
+}
+
+export interface AvatarValidationSuccess {
+  ok: true;
+  mimeType: AllowedAvatarMimeType;
+  extension: string;
+}
+
+export type AvatarValidation = AvatarValidationSuccess | AvatarValidationFailure;
+
+const EXTENSION_BY_MIME: Record<AllowedAvatarMimeType, string> = {
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'image/heic': 'heic',
+};
+
+const isAllowedMime = (value: string): value is AllowedAvatarMimeType =>
+  (ALLOWED_AVATAR_MIME_TYPES as readonly string[]).includes(value);
+
+/**
+ * Validate a picked image by declared type and size.
+ *
+ * Deliberately does NOT trust the file extension in the URI: a `.jpg` suffix
+ * says nothing about the bytes. The picker's `mimeType` is used instead, and
+ * the extension we store is derived from that MIME type rather than from the
+ * incoming filename.
+ *
+ * This is still a client-side declaration and could be forged by a modified
+ * client, which is why the bucket carries the same constraints.
+ */
+export const validateAvatar = (image: PickedImage): AvatarValidation => {
+  const mimeType = image.mimeType?.toLowerCase();
+
+  if (!mimeType) {
+    return { ok: false, message: 'Could not tell what kind of file that is. Please pick another.' };
+  }
+
+  if (!isAllowedMime(mimeType)) {
+    return { ok: false, message: 'Please choose a JPEG, PNG, WebP or HEIC image.' };
+  }
+
+  if (image.fileSize === undefined) {
+    return { ok: false, message: 'Could not read that file’s size. Please pick another.' };
+  }
+
+  if (image.fileSize > MAX_AVATAR_BYTES) {
+    const mb = (image.fileSize / (1024 * 1024)).toFixed(1);
+    return { ok: false, message: `That image is ${mb} MB. Please choose one under 5 MB.` };
+  }
+
+  if (image.fileSize === 0) {
+    return { ok: false, message: 'That file appears to be empty. Please pick another.' };
+  }
+
+  return { ok: true, mimeType, extension: EXTENSION_BY_MIME[mimeType] };
+};
+
+/**
+ * Canadian postal code validation, mirroring the CHECK constraint in migration
+ * 0008. Canada Post never uses D, F, I, O, Q or U in any position, nor W or Z
+ * in the first — so `A1A 1A1` alone is too loose a test.
+ *
+ * Accepts an optional space or hyphen in the middle and any case; the caller
+ * normalises before sending.
+ */
+const POSTAL_CODE_PATTERN = /^[ABCEGHJ-NPRSTVXY]\d[ABCEGHJ-NPRSTV-Z][ -]?\d[ABCEGHJ-NPRSTV-Z]\d$/i;
+
+export const isValidPostalCode = (value: string): boolean => POSTAL_CODE_PATTERN.test(value.trim());
+
+/** `m5v2t6` / `m5v 2t6` -> `M5V 2T6`. Returns null when not a valid code. */
+export const normalisePostalCode = (value: string): string | null => {
+  const compact = value.replace(/[\s-]+/g, '').toUpperCase();
+  if (!POSTAL_CODE_PATTERN.test(compact)) {
+    return null;
+  }
+  return `${compact.slice(0, 3)} ${compact.slice(3)}`;
+};
+
+export interface ServiceFailure {
+  ok: false;
+  message: string;
+}
+
+export type ProfileResult = { ok: true; profile: ProfileRow } | ServiceFailure;
+
+/** The signed-in user's own profile. */
+export const getMyProfile = async (userId: Uuid): Promise<ProfileResult> => {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select(PROFILE_COLUMNS)
+    .eq('id', userId)
+    .single();
+
+  if (error || !data) {
+    return { ok: false, message: 'Could not load your profile. Please try again.' };
+  }
+
+  return { ok: true, profile: data };
+};
+
+/**
+ * Patch the signed-in user's profile.
+ *
+ * RLS restricts this to the caller's own row, and column grants restrict it to
+ * display_name / avatar_url / postal_code / bio — so a forged `id` in the patch
+ * cannot reassign the row, and `postal_fsa` cannot be desynced from
+ * `postal_code`.
+ *
+ * A successful UPDATE that matches no row returns zero rows rather than an
+ * error, which is how RLS denials surface. That is treated as a failure here;
+ * see SECURITY.md.
+ */
+export const updateMyProfile = async (
+  userId: Uuid,
+  patch: ProfileUpdate,
+): Promise<ProfileResult> => {
+  const { data, error } = await supabase
+    .from('profiles')
+    .update(patch)
+    .eq('id', userId)
+    .select(PROFILE_COLUMNS);
+
+  if (error) {
+    return { ok: false, message: 'Could not save your profile. Please try again.' };
+  }
+
+  const row = data?.[0];
+  if (!row) {
+    // Zero rows from an UPDATE means no row was visible/writable to us.
+    return { ok: false, message: 'Could not save your profile — please sign in again.' };
+  }
+
+  return { ok: true, profile: row };
+};
+
+export type AvatarUploadResult = { ok: true; publicUrl: string; path: string } | ServiceFailure;
+
+/**
+ * Validate, upload, and record a new avatar.
+ *
+ * The object path is `{userId}/avatar.{ext}`. The leading folder is what the
+ * storage policies in 0009 check against `auth.uid()`, so one user can never
+ * overwrite another's file. `upsert` is on so re-uploading replaces rather than
+ * accumulating orphans.
+ */
+export const uploadMyAvatar = async (
+  userId: Uuid,
+  image: PickedImage,
+): Promise<AvatarUploadResult> => {
+  const validation = validateAvatar(image);
+  if (!validation.ok) {
+    return { ok: false, message: validation.message };
+  }
+
+  // The documented React Native path: read the local URI into an ArrayBuffer.
+  // Blob/FormData are unreliable under Hermes.
+  let body: ArrayBuffer;
+  try {
+    body = await fetch(image.uri).then((response) => response.arrayBuffer());
+  } catch {
+    return { ok: false, message: 'Could not read that image from your device.' };
+  }
+
+  if (body.byteLength > MAX_AVATAR_BYTES) {
+    // Re-check the ACTUAL bytes, not the picker's claim about them.
+    return { ok: false, message: 'That image is too large. Please choose one under 5 MB.' };
+  }
+
+  const path = `${userId}/avatar.${validation.extension}`;
+
+  const { error: uploadError } = await supabase.storage
+    .from(AVATAR_BUCKET)
+    .upload(path, body, { contentType: validation.mimeType, upsert: true });
+
+  if (uploadError) {
+    return { ok: false, message: 'Could not upload that photo. Please try again.' };
+  }
+
+  const {
+    data: { publicUrl },
+  } = supabase.storage.from(AVATAR_BUCKET).getPublicUrl(path);
+
+  // Cache-bust: the path is stable across re-uploads, so without this the old
+  // image would keep being served from cache.
+  const versionedUrl = `${publicUrl}?v=${Date.now()}`;
+
+  const saved = await updateMyProfile(userId, { avatar_url: versionedUrl });
+  if (!saved.ok) {
+    return { ok: false, message: saved.message };
+  }
+
+  return { ok: true, publicUrl: versionedUrl, path };
+};

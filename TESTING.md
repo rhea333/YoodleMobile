@@ -1,0 +1,776 @@
+# Yoodle — Testing Log
+
+A running, append-only record. Each phase adds a dated section; earlier sections
+are never rewritten.
+
+---
+
+## 2026-09-10 — Phase 1: project scaffold & design system
+
+No automated test runner is installed yet (no Jest, no RNTL) — that is deliberate
+for a skeleton phase and should be revisited once there is logic worth unit
+testing. Verification below is split into what was actually run and what still
+needs a human with a simulator.
+
+### Verified automatically
+
+| Check                                 | Command                              | Result                                                                                                                         |
+| ------------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| TypeScript, strict, no `any`          | `npm run typecheck`                  | passes, 0 errors                                                                                                               |
+| ESLint (flat config, expo + prettier) | `npm run lint`                       | passes, 0 errors **and 0 warnings**                                                                                            |
+| Prettier formatting                   | `npm run format:check`               | all files formatted                                                                                                            |
+| iOS bundle                            | `npx expo export --platform ios`     | 1231 modules, Hermes bytecode produced                                                                                         |
+| Android bundle                        | `npx expo export --platform android` | 1226 modules, Hermes bytecode produced                                                                                         |
+| Token pipeline                        | `npx tailwindcss -i global.css -o …` | token values reach the CSS, e.g. `bg-primary-dark` → `rgb(224 138 82)` (`#E08A52`), `p-xl` → `24px`, `text-body` → `15px/22px` |
+| Press + dark variants                 | same build, selector grep            | all 6 `active:` and all 5 `dark:active:` selectors generated                                                                   |
+| WCAG contrast, 13 pairs × 2 schemes   | computed from `tokens.ts`            | 26/26 pass after the token corrections below                                                                                   |
+
+The bundle checks matter more than they look: they are what proves the Babel
+chain (including `react-native-worklets/plugin`, required by Reanimated 4), the
+Metro + NativeWind CSS transform, and every import path actually resolve
+together. A missing worklets plugin or a bad `global.css` wiring fails here.
+
+Four real type errors were found and fixed during this phase rather than
+suppressed: a union-type leak in `useTheme` (the dark palette was not assignable
+to the light palette's literal types — now both widen to `ThemeColors`, which
+also forces the dark theme to define every role), Tailwind's string-valued
+spacing/radius maps receiving numeric tokens, and a missing `*.css` module
+declaration.
+
+### Still needs manual verification — please run these
+
+`npm install` first, then:
+
+1. **iOS simulator boots clean**
+   `npm run ios` (or `npm start` then press `i`). Expect the Home screen with a
+   "Yoodle" header, no red box, no yellow warning box.
+2. **Android emulator boots clean**
+   `npm run android` (or `npm start` then press `a`). Same expectation.
+   Note: this machine has the Android SDK and `adb` but **no AVD created**, so
+   the Android run has never been executed here — create an emulator in Android
+   Studio first.
+3. **Light mode look** — check `Button` and `Card` specifically:
+   - all five button variants (primary, accent, secondary, ghost, danger)
+   - `sm` / `lg` sizes, the loading spinner, the disabled state at 50% opacity
+   - three card variants: elevated (shadow), outlined (border), filled (muted
+     surface)
+   - the filled card is pressable — tapping it should dim to 80% opacity
+4. **Dark mode look** — tap **"Switch to dark mode"** at the top of the Home
+   screen. This toggles at runtime via `useColorScheme().toggleColorScheme()`, so
+   you do **not** need to restart the simulator or change the OS setting. Confirm
+   every surface, border and text colour moves, and that nothing becomes
+   low-contrast — especially the `ghost` and `secondary` buttons and the badge
+   row.
+   Then separately flip the **OS** appearance setting to confirm the app follows
+   the system too (`app.json` → `userInterfaceStyle: "automatic"`; the template
+   shipped `"light"`, which would have pinned the app to light mode forever).
+5. **Text input behaviour** — focus the "Job title" field and confirm the border
+   changes to the focus-ring token; confirm the "Postal code" field shows its
+   error text in the danger colour; confirm the disabled field is dimmed and not
+   editable.
+6. **Fresh-clone sanity** — the real test of the lint/type-check claim:
+   ```
+   git clone <repo> fresh && cd fresh && npm install
+   npm run typecheck && npm run lint
+   ```
+   Both must exit 0.
+
+### Known gaps
+
+- No unit or component tests, and no CI workflow. Worth adding Jest +
+  `@testing-library/react-native` before the first screen with real logic.
+- The design system has only been inspected as generated CSS and as a web
+  preview, **not** as pixels on a device — item 3 and 4 above are the first real
+  look.
+- **No screen-reader pass yet.** Components do carry `accessibilityRole`,
+  `accessibilityLabel` and `accessibilityState`, and contrast is now measured
+  (below), but nothing has been driven with VoiceOver or TalkBack.
+- No dynamic-type / font-scaling check. The type scale is fixed px; large OS
+  font settings have not been tried.
+
+### Contrast audit and the token corrections it forced
+
+Every foreground/background pair the components actually compose was measured
+against its own background. Six pairs failed on first pass, all in **light**
+mode, all fixed in `tokens.ts`:
+
+| Pair                                     | Before | After  | Change                                   |
+| ---------------------------------------- | ------ | ------ | ---------------------------------------- |
+| `warning` on `warningSubtle`             | 3.66:1 | 4.54:1 | amber base `#A9741A` → `#956617`         |
+| `textMuted` on `surface`                 | 3.75:1 | 4.50:1 | new `sand[550]` `#807568` for light only |
+| `primary` on `background` (ghost button) | 4.41:1 | 4.58:1 | clay 600 `#B85C2A` → `#B45A29`           |
+| `success` on `successSubtle`             | 4.42:1 | 4.54:1 | green base → `#2D7B59`                   |
+| `danger` on `dangerSubtle`               | 4.41:1 | 4.55:1 | red base → `#BD412D`                     |
+| `borderStrong` on `surface`              | 1.51:1 | 3.75:1 | `sand[300]` → `sand[500]`                |
+
+Most are 2% nudges you will not notice. **One is a visible design change worth
+your opinion:** `borderStrong` drives the secondary button's outline, and the
+secondary button sits on a near-white background, so that border was the only
+thing defining the control — at 1.51:1 it failed WCAG 1.4.11 (3:1 for
+identifying UI components). It is now a clearly visible warm grey. If that reads
+as too heavy, the honest alternatives are a tinted secondary fill or a slightly
+lighter border plus a stronger shadow — not simply reverting. Plain `border`
+(dividers and card outlines) was left subtle on purpose; decorative separators
+are not held to 3:1.
+
+`sand[550]` exists because darkening `textMuted` for light mode would have _hurt_
+dark mode, where the same value sits on a dark surface. Light uses `sand[550]`,
+dark keeps `sand[500]` — both now clear 4.5:1.
+
+---
+
+## 2026-09-14 — Phase 1 follow-up: dependency bump & device-testing route
+
+Closing out the two loose ends the phase 1 audit left open. Earlier sections
+above are unchanged.
+
+### Dependency bump
+
+`expo` was a patch behind what SDK 57 expects (`57.0.21`, expected `~57.0.22`).
+Fixed with `npx expo install --fix`, which changed 12 packages.
+
+| Check                        | Command                              | Result                                                                              |
+| ---------------------------- | ------------------------------------ | ----------------------------------------------------------------------------------- |
+| Expo SDK consistency         | `npx expo-doctor`                    | **21/21 checks pass**                                                               |
+| TypeScript, strict, no `any` | `npm run typecheck`                  | passes, 0 errors                                                                    |
+| ESLint                       | `npm run lint`                       | passes, 0 errors/warnings                                                           |
+| Prettier                     | `npm run format:check`               | all files formatted                                                                 |
+| Android bundle               | `npx expo export --platform android` | Hermes output, bundle hash `index-40a3fa17…hbc` **identical** to the pre-bump build |
+
+Re-running the bundle after the bump matters: it is the check that would catch a
+patch bump breaking the Babel/Metro/NativeWind chain. Module count is unchanged.
+
+### Android emulator — AVD created, but the boot check is STILL NOT VERIFIED
+
+This machine has the Android SDK, `adb`, the emulator binary and two system
+images (`android-34`, `android-VanillaIceCream`) but **no `cmdline-tools`, so no
+`avdmanager`**. An AVD was therefore defined by hand rather than downloading more
+tooling. For reproducibility, `Yoodle_API34` consists of two files:
+
+- `%USERPROFILE%\.android\avd\Yoodle_API34.ini` — `path`, `path.rel`, `target=android-34`
+- `%USERPROFILE%\.android\avd\Yoodle_API34.avd\config.ini` — pixel_5 profile, x86_64,
+  `image.sysdir.1=system-images\android-34\google_apis\x86_64\`
+
+It boots: Android 14, `sys.boot_completed=1` in ~50s, `adb devices` shows
+`emulator-5554`. Expo Go (`host.exp.exponent`) downloaded and installed cleanly.
+
+**But the app never rendered.** Expo Go bounced straight back to the launcher,
+and `logcat` showed repeated ANRs in `system` and `com.google.android.gms.persistent`
+plus long `system_server` monitor contention. Cause is the emulator, not Yoodle:
+2 GB RAM on a `swiftshader_indirect` software GPU is not enough to run Expo Go.
+The emulator was shut down rather than tuned further, because a physical device
+is the better surface anyway (see below).
+
+So: **"app boots clean on an Android emulator" remains unverified.** The bundle
+export proves the code compiles and resolves; it does not prove first paint.
+
+### iOS simulator — permanently blocked on this machine
+
+This is a Windows machine. An iOS simulator requires macOS + Xcode, so this
+check cannot be run here at all, now or later. The options are a Mac, or a
+physical iPhone via Expo Go / an EAS build. **Not a configuration gap — a
+platform one.** Recording it so no later phase logs it as "pending setup".
+
+### Chosen route: physical device via Expo Go
+
+One device closes both platform gaps. `npx expo start`, then scan the QR with
+Expo Go (Android) or the Camera app (iOS). Phone and this machine must be on the
+same Wi-Fi; the Wi-Fi adapter here is `172.17.247.102`, and note the machine also
+has virtual adapters (`192.168.56.1`, `192.168.178.1`) that Expo could pick
+incorrectly — if the QR does not connect, `npx expo start --tunnel` bypasses
+network topology entirely.
+
+The manual checklist is unchanged — items 1–6 in the phase 1 section above, with
+"simulator" read as "device".
+
+### Known constraint for later phases: no local dev-build toolchain
+
+There is **no JDK and no Gradle** on this machine (no Android Studio JBR either),
+so `npx expo run:android` cannot produce a development build locally. Expo Go is
+currently the only way to run Yoodle on a device here.
+
+This will become blocking, because Expo Go only includes the native modules
+bundled into it. The Stripe React Native SDK in particular does **not** work in
+Expo Go, so the payments phase will require either a JDK installed locally or
+EAS Build. Worth deciding before that phase starts, not during it.
+
+---
+
+## 2026-09-14 — Real brand palette: dark-first rewrite & contrast re-audit
+
+The placeholder clay/teal palette was replaced with Yoodle's real brand colours,
+sampled from the live site. The brand is **dark-first** — near-black is the
+primary surface, not a dark-mode alternate — so the app is now single-theme.
+Earlier sections are unchanged.
+
+### What the dark-first decision changed
+
+Route A (dark-only) was chosen over keeping a light/dark pair. The obstacle was
+never the tokens: in NativeWind the **unprefixed class is the default**, so
+"dark is default" cannot be expressed by swapping token values. There were 67
+`dark:` classes across 8 files; all are gone.
+
+| File                           | Change                                                      |
+| ------------------------------ | ----------------------------------------------------------- |
+| `theme/tokens.ts`              | one palette, not a light/dark pair; brand vs derived marked |
+| `tailwind.config.ts`           | one emission per role, no `-dark` twin; `darkMode` unset    |
+| `hooks/useTheme.ts`            | no scheme branch; now only serves literal colour props      |
+| `navigation/RootNavigator.tsx` | always `DarkTheme`, `StatusBar style="light"`               |
+| 5 components + `HomeScreen`    | all 67 `dark:` classes stripped                             |
+| `app.json`                     | `userInterfaceStyle` `"automatic"` → `"dark"`               |
+
+`darkMode` is deliberately left unset in the Tailwind config so a stray `dark:`
+class cannot silently reintroduce a second theme.
+
+### Verified automatically
+
+| Check                | Command                              | Result                                           |
+| -------------------- | ------------------------------------ | ------------------------------------------------ |
+| TypeScript, strict   | `npm run typecheck`                  | passes, 0 errors                                 |
+| ESLint               | `npm run lint`                       | passes, 0 errors/warnings                        |
+| Prettier             | `npm run format:check`               | all files formatted                              |
+| Expo SDK consistency | `npx expo-doctor`                    | 21/21 pass                                       |
+| Android bundle       | `npx expo export --platform android` | 1223 modules, Hermes output                      |
+| Token pipeline       | `npx tailwindcss -i global.css -o …` | all 11 brand values reach the CSS                |
+| No theme leakage     | selector grep on generated CSS       | zero `dark:` variant selectors emitted           |
+| WCAG, 30 pairs       | computed from `tokens.ts`            | **27 pass, 3 fail** — all 3 are plane separation |
+
+### Contrast re-audit against the real values
+
+The brand palette is strong. `textPrimary` on `background` is **16.04:1**,
+`textSecondary` **6.89:1**, the CTA as text **8.70:1**. Every text pair in all
+five components passes.
+
+Two of my own **derived** values failed on first pass and were corrected (these
+were mine, not brand, so correcting them is not a brand change):
+
+| Token           | Was     | Now     | Why                                                                                                                    |
+| --------------- | ------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `accentPressed` | #4E7D5F | #6BA37F | 3.99 → 6.46. Pressed had to go _lighter_, not darker: the accent carries a dark label, so darkening it loses contrast. |
+| `textMuted`     | #74857B | #7A8C82 | 4.40 → 4.82 on `surface`. Still clearly dimmer than `textSecondary` (6.25).                                            |
+
+Also corrected, as a role mapping rather than a colour change: the CTA and
+accent are **light** greens, so their labels are `#0C1210`, not `textPrimary`.
+Mapped that way they measure 8.70:1 and 5.23:1; mapped the other way they were
+1.84:1 and 3.07:1.
+
+### Three failures NOT adjusted — they need a brand decision
+
+All three are the same problem: **on a #0C1210 ground, nothing in the palette
+separates one plane from another.** None is a WCAG violation, but all three are
+real legibility questions.
+
+| Pair                            | Ratio      | Note                               |
+| ------------------------------- | ---------- | ---------------------------------- |
+| `surfaceMuted` vs `background`  | **1.23:1** | the filled secondary button's fill |
+| `surface` vs `background`       | **1.10:1** | every Card against the page        |
+| `successSubtle` vs `background` | **1.51:1** | all subtle Badge fills             |
+
+Why they are not violations: WCAG 1.4.11 wants 3:1 for whatever _identifies_ a
+control, and each of these controls is identified by its label instead — the
+secondary button's text measures 13.02:1, the success badge's 7.60:1. Card edges
+are decorative, which 1.4.11 exempts.
+
+Why they still matter, and what it would cost to "fix": clearing 3:1 above
+#0C1210 needs a surface around `#4A5A50`, which is no longer a dark-first
+surface. I walked the brand border up too — `#33403A` → 1.58, `#3C4A42` → 1.84,
+`#4C5D53` → 2.45, `#55685C` → 2.88 — you do not clear 3:1 until roughly
+`#586B5F`, which reads grey rather than green. **There is no in-palette fix.**
+
+The practical consequence to look at on a device: **`Card`'s `elevated` variant
+has lost its only cue.** It relied on a shadow, and a black shadow on near-black
+is nearly invisible. Left as-is on purpose — raising `surface` or giving
+`elevated` a border is a brand call, not a contrast fix.
+
+### Still open
+
+- **Status colours are carried over, not designed.** The brand set defines no
+  success/warning/danger/info. The previous ramps were re-measured against the
+  new ground and all four pass (7.60 / 7.96 / 6.44 / 6.73), but they were not
+  chosen for this palette.
+- **`success` is green and so is the CTA.** A green "Open" badge reads as brand
+  chrome rather than as a status. Contrast cannot fix this; it needs a hue
+  decision.
+- **The accent gradient does not render.** `#5C9270 → #94D0A5` is stored as
+  stops in `gradients.accent` and shown on HomeScreen as two solid swatches. A
+  real gradient needs `expo-linear-gradient`, deliberately not installed.
+- **`borderStrong` is now unused** by any component, since `secondary` became a
+  filled variant. Kept as part of the role contract.
+
+### Manual check, on a device
+
+The light/dark toggle is gone, so items 3–4 of the phase 1 checklist collapse
+into one pass. Priority order:
+
+1. App boots to the near-black ground, no red box, "Yoodle" header.
+2. **Do the Cards read as cards?** This is the real question — see the 1.10:1
+   finding. Compare `elevated`, `outlined` and `filled` side by side.
+3. The secondary button is now **filled**, not outlined. Does it read as a
+   button, and is it clearly subordinate to the CTA?
+4. The two gradient swatches at the top — confirm those are the right brand
+   greens before a real gradient gets wired in.
+5. Badges: does the green "Success" badge read as a status, or as brand chrome?
+
+---
+
+## 2026-09-14 — Phase 2: Supabase client, schema, RLS and auth services
+
+No UI this phase, so there is nothing to look at on a device. Verification is
+split into what ran here and what needs a live Supabase project — which is most
+of it, because **the migrations were deliberately not applied**.
+
+### Verified automatically
+
+| Check                        | Command                                         | Result                                        |
+| ---------------------------- | ----------------------------------------------- | --------------------------------------------- |
+| TypeScript, strict, no `any` | `npm run typecheck`                             | passes, 0 errors                              |
+| ESLint                       | `npm run lint`                                  | passes, 0 errors/warnings                     |
+| Prettier                     | `npm run format:check`                          | all files formatted                           |
+| Metro resolution of new deps | `npx expo export` with a temporary import probe | **1281 modules vs 1223** — see the note below |
+| Tables / RLS cross-check     | grep over `supabase/migrations/*.sql`           | 5 tables created, 5 with RLS on, 21 policies  |
+| Helper references            | defined-vs-referenced diff                      | every `app.*` helper used by a policy exists  |
+
+**The module-probe note matters.** A plain `expo export` bundled 1223 modules —
+_identical_ to phase 1 — because nothing in the app imports `src/services` yet.
+That bundle proved nothing about the new code. A temporary file importing the
+client and auth functions was added to force the modules into the graph; the
+count rose to 1281 with no resolution errors, which is what actually proves
+`@supabase/supabase-js`, `aes-js`, AsyncStorage, SecureStore and
+`react-native-get-random-values` all resolve under Metro. The probe was removed
+afterwards and `index.ts` restored.
+
+### Five real bugs found and fixed in my own migrations before handing them over
+
+Written down because each would have failed at a different, confusing moment:
+
+1. **Helper functions could not be created.** `language sql` bodies are
+   name-resolved at CREATE time, and the helpers reference `public.jobs` /
+   `public.offers`, which do not exist until 0003/0004. Migration 0001 would
+   have failed immediately. Converted to `plpgsql`, whose bodies resolve on
+   first execution. No performance cost — SECURITY DEFINER functions are never
+   inlined anyway.
+2. **`force row level security` would have broken sign-up.** It subjects the
+   table owner to RLS, and the profile-creation trigger is SECURITY DEFINER
+   running as the owner against policies granted `to authenticated`. Every
+   sign-up would have failed on the profile insert, and `job_exact_location`
+   would have returned nothing for anyone. Removed from all five tables.
+3. **A column REVOKE that was silently a no-op.** `revoke update (id) on
+profiles` does nothing while a table-level UPDATE grant exists, and Supabase
+   grants that by default, so `id` would have stayed rewritable by its owner.
+   Fixed to revoke the table-level grant first, then re-grant `display_name`
+   and `avatar_url` individually.
+4. **Every radius search would have failed.** `nearby_jobs` is SECURITY INVOKER
+   (deliberately, so RLS still filters drafts), so it reads `location_coarse`
+   with the _caller's_ privileges — and that column was excluded from the SELECT
+   grant. "permission denied for table jobs" on every call. Granted.
+5. **A migration-halting grant.** `grant usage on schema extensions` raises if
+   you do not own the schema. Wrapped so it warns instead of aborting 0001.
+
+### Still needs a live project — the real tests
+
+Do all of this against a **throwaway project**, never production.
+
+**Step 0 — create the project.** Region `ca-central-1`. This cannot be changed
+later, and the throwaway should mirror production.
+
+**Step 1 — PostGIS.** Database → Extensions → `postgis` → **"Create a new
+schema"**. The migrations schema-qualify everything as `extensions.*`. PostGIS
+2.3+ is not relocatable, so getting this wrong means a backup/drop/restore.
+
+**Step 2 — auth settings.** Authentication → Providers → enable Email. Turn
+**"Confirm email" OFF** on the throwaway so two test accounts can be made
+without inbox round-trips. Leave it **ON** for production.
+
+**Step 3 — run the migrations in order**, in the SQL editor:
+
+```
+supabase/migrations/0001_extensions_and_helpers.sql
+supabase/migrations/0002_profiles.sql
+supabase/migrations/0003_jobs.sql
+supabase/migrations/0004_offers.sql
+supabase/migrations/0005_messages.sql
+supabase/migrations/0006_reviews.sql
+supabase/migrations/0007_location_rpcs.sql
+```
+
+0001 raises if PostGIS is missing and warns if it is in the wrong schema, so a
+misconfigured project fails loudly on the first file rather than halfway.
+
+**Step 4 — assert RLS.** Run `supabase/tests/verify_rls.sql`. Expect four
+`PASS` notices and a summary table listing all five tables with
+`rls_enabled = true` and a non-zero policy count. Any raised exception here is
+a real hole — stop and fix it before going further.
+
+**Step 5 — seed.** Create two accounts (A and B), paste their UUIDs into the
+top of `supabase/tests/seed_test_data.sql`, and run it. It refuses to run until
+you replace the placeholder UUIDs.
+
+**Step 6 — the isolation tests.** These are the point of the phase. Sign in as
+**A**, then attempt each of these _through the client SDK_ — not the SQL editor,
+which runs as service_role and bypasses RLS, so it would tell you nothing:
+
+| Attempt as A                                    | Expected                               |
+| ----------------------------------------------- | -------------------------------------- |
+| update B's profile row                          | 0 rows affected                        |
+| select B's profile row                          | visible — names are readable by design |
+| select messages on a job A is not party to      | **0 rows**                             |
+| select the `location` column on any job         | error — column not selectable          |
+| `rpc('job_exact_location')` on a job A isn't on | **0 rows**                             |
+| select offers belonging to B's job              | 0 rows — rival bids stay hidden        |
+| insert a message with `sender_id` set to B      | rejected                               |
+| insert a review on a job that isn't `completed` | rejected                               |
+
+Then sign in as **B**, who _did_ offer on A's job, and confirm B **can** read
+that job's thread. A policy that denies everyone is not a passing test.
+
+**Step 7 — PostGIS radius.** `seed_test_data.sql` ends with four queries whose
+answers are stated inline. Expected, measured from Toronto City Hall:
+
+- coarse rounding turns `43.6532,-79.3832` into `43.65,-79.38`
+- 500 m → 2 rows; 5 km → 3 rows; 20 km → all 4, Scarborough last at ~11 km
+- those counts are as **service_role**. Re-run `nearby_jobs` as a signed-in
+  client and the draft job must **disappear** — that difference is the proof
+  that RLS is filtering inside the RPC.
+
+**Step 8 — auth round-trip.** With `.env` filled in, call `signUpWithEmail`
+then `signInWithEmail` from a scratch script or the next phase's screens.
+Confirm a profile row appears automatically (the `on_auth_user_created`
+trigger), and that signing out and back in restores the session from encrypted
+storage.
+
+### Known gaps
+
+- **None of the SQL has been executed anywhere.** It is reviewed and
+  cross-checked, not run. Expect at least one thing to need adjusting on first
+  application — most likely a grant.
+- Still no automated test runner. The step 6 matrix is exactly what should
+  become the first integration suite; done by hand it will not be re-run every
+  time a policy changes.
+- `src/services` has no data-access functions yet — only the client and auth.
+  Jobs/offers/messages queries arrive with the screens that need them.
+- `.env` is not populated here, so `supabase.ts` throws on import by design,
+  with a message naming the two variables and the `--clear` restart.
+
+---
+
+## 2026-09-15 — Phase 2 migrations APPLIED and verified against a live database
+
+The migrations are no longer unexecuted. All seven were applied to the Yoodle
+prototype project `aovsfxypbdoppezlyjus` (`ca-central-1`) and every claim in the
+previous section has now been checked behaviourally rather than by reading SQL.
+Earlier sections unchanged.
+
+### Getting connected — the MCP was pointed at the wrong database
+
+Worth recording, because it nearly caused real damage. Claude Code reads MCP
+servers from `~/.claude.json`, **not** from the `mcpServers` block in
+`~/.claude/settings.json`. That second block existed, looked authoritative, and
+was inert. Three window reloads changed nothing because the edits were going to
+the file nothing reads.
+
+The diagnosis came from inspecting the running process: the live server was
+`node …/mcp-server-supabase/dist/transports/stdio.js` with **no arguments**,
+taking its token from a `SUPABASE_ACCESS_TOKEN` env var — which could not have
+come from the file being edited.
+
+Two things made this dangerous rather than merely annoying:
+
+1. The stale config had **no `--project-ref`**, so the server was unscoped and
+   could address any project the token could reach.
+2. The token it held reached a **different, live project** holding real user
+   data, Stripe records and password history.
+
+Had the migrations been applied while in that state, `0002_profiles.sql`'s
+`create table if not exists public.profiles` would have silently no-op'd against
+that project's existing `profiles` table and then applied Yoodle's triggers,
+policies and column revokes to it.
+
+Now fixed: correct token in `~/.claude.json`, plus
+`--project-ref aovsfxypbdoppezlyjus` so the server is confined to Yoodle. The
+scoping is visible in the tool surface — account-level tools (`list_projects`,
+`create_project`, `pause_project`) are no longer advertised at all.
+
+**Confirmed identity before writing anything:** `public_tables: 0`,
+`auth_users: 0`. An empty database, not the 12-table one.
+
+### Migrations applied
+
+| Migration                     | Result   |
+| ----------------------------- | -------- |
+| PostGIS → `extensions` schema | 3.3.7 ✅ |
+| `0001_extensions_and_helpers` | ✅       |
+| `0002_profiles`               | ✅       |
+| `0003_jobs`                   | ✅       |
+| `0004_offers`                 | ✅       |
+| `0005_messages`               | ✅       |
+| `0006_reviews`                | ✅       |
+| `0007_location_rpcs`          | ✅       |
+
+**All seven applied on the first attempt with zero failures.** The previous
+section predicted "expect a grant or two to need adjusting" — that turned out to
+be wrong, because the five bugs found by reading the SQL were the ones that
+would have failed. Code review caught them; the live run found nothing new.
+
+### Structural verification
+
+| Check                         | Result                                                                                                                                               |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| RLS enabled                   | all 5 tables ✅                                                                                                                                      |
+| Policy count                  | **21** — jobs 5, offers 6, reviews 4, profiles 3, messages 3                                                                                         |
+| `jobs.location` client-select | **not granted** to anon or authenticated ✅                                                                                                          |
+| `jobs` client-selectable cols | 12, `location` absent: id, poster_id, title, description, category, budget, location_coarse, coarse_lat, coarse_long, status, created_at, updated_at |
+| `profiles` client-updatable   | only `display_name`, `avatar_url` — `id` locked ✅                                                                                                   |
+| Grants to `PUBLIC`            | none ✅                                                                                                                                              |
+
+The `profiles` result confirms the column-revoke fix worked. Before it, the
+table-level UPDATE grant would have left `id` rewritable.
+
+### Behavioural verification
+
+**Profile trigger.** Two users inserted into `auth.users`; both profiles
+appeared automatically with `display_name` lifted from `raw_user_meta_data`.
+
+**Coarse-location trigger.** Exact → rounded, as intended:
+
+| Exact             | Coarse        |
+| ----------------- | ------------- |
+| 43.6532, -79.3832 | 43.65, -79.38 |
+| 43.6658, -79.3832 | 43.67, -79.38 |
+| 43.7000, -79.2600 | 43.70, -79.26 |
+
+**PostGIS radius — and the proof RLS filters inside the RPC.** Same query, two
+roles:
+
+| Radius | as `service_role` | as `anon` |
+| ------ | ----------------- | --------- |
+| 500 m  | 2                 | **1**     |
+| 5 km   | 3                 | **2**     |
+| 20 km  | 4                 | **3**     |
+
+The difference is the seeded **draft** job, which sits at the same coordinates
+as a published one. It appears for `service_role` (which bypasses RLS) and
+**disappears for `anon`** at every radius. That gap is the evidence that
+`nearby_jobs` being `SECURITY INVOKER` actually matters — as `SECURITY DEFINER`
+it would have leaked drafts.
+
+**Isolation, using a third account (C) party to nothing:**
+
+| Probe as C                      | Expected | Actual |
+| ------------------------------- | -------- | ------ |
+| messages visible                | 0        | **0**  |
+| offers visible                  | 0        | **0**  |
+| published jobs visible          | 3        | **3**  |
+| draft jobs visible              | 0        | **0**  |
+| `job_exact_location` on A's job | 0        | **0**  |
+| profiles visible                | 3        | **3**  |
+
+**Write attempts as C:**
+
+| Attempt              | Result                                             |
+| -------------------- | -------------------------------------------------- |
+| forge a message as A | **rejected** — `42501 new row violates RLS policy` |
+| update A's profile   | 0 rows                                             |
+| update A's job       | 0 rows                                             |
+| delete A's job       | 0 rows                                             |
+| update B's offer     | 0 rows                                             |
+
+Note the two failure modes: a bad INSERT raises, while a bad UPDATE/DELETE
+silently affects zero rows. Client code must treat "0 rows affected" as a
+permission failure, not as success.
+
+**Counter-test — legitimate parties can still work.** A policy that denies
+everyone would pass every test above, so:
+
+| Probe                            | Expected | Actual |
+| -------------------------------- | -------- | ------ |
+| B sees own thread                | 1        | **1**  |
+| B sees own offer                 | 1        | **1**  |
+| A sees own thread                | 1        | **1**  |
+| A sees offers on own job         | 1        | **1**  |
+| A sees own draft                 | 1        | **1**  |
+| A sees all own jobs              | 4        | **4**  |
+| A gets exact location of own job | 1        | **1**  |
+
+**The exact-location gate, end to end** — the privacy mechanism that matters
+most:
+
+1. B's offer `pending` → `job_exact_location` returns **0 rows**
+2. A accepts B's offer
+3. B → **1 row, 43.6532 / -79.3832** (the true point)
+4. C, after that acceptance → still **0 rows**
+
+So the exact address is released only to the accepted worker, and only once
+accepted.
+
+### Test data currently in the database
+
+3 auth users, 4 jobs, 1 accepted offer, 1 message, 0 reviews. Left in place as
+fixtures for the phase 3 screens.
+
+Two caveats:
+
+- The users were inserted **directly via SQL**, so they have no `auth.identities`
+  rows and may not sign in through the auth API. Create real accounts through
+  the app for auth testing.
+- They have **known passwords** (`test-password-a` / `-b` / `-c`). Acceptable in
+  a prototype; they must not survive into anything real.
+
+`supabase/tests/seed_test_data.sql` can recreate equivalent fixtures after a
+reset — update the UUIDs at the top first.
+
+### Not verified
+
+- **`get_advisors`** (Supabase's own security linter) is refused by the current
+  token — it needs a Project-level scope this PAT lacks. An independent
+  second opinion on the schema is therefore still outstanding; add the scope and
+  re-run if you want it.
+- **Auth round-trip through the client SDK** — `signUpWithEmail` /
+  `signInWithEmail` have still never been called. `.env` is now populated, so
+  this is doable, but it needs UI or a scratch script and belongs with phase 3.
+- **Realtime** is not enabled on any table.
+- The MCP token used for all of this is in the session transcript and should be
+  rotated when prototype work ends.
+
+---
+
+## 2026-09-15 — Phase 3: auth & onboarding screens
+
+First phase with screens a person can actually use, so most of what matters is
+manual. Earlier sections unchanged.
+
+### Verified automatically
+
+| Check                        | Command                              | Result                                          |
+| ---------------------------- | ------------------------------------ | ----------------------------------------------- |
+| TypeScript, strict, no `any` | `npm run typecheck`                  | passes, 0 errors                                |
+| ESLint                       | `npm run lint`                       | passes, 0 errors/warnings                       |
+| Prettier                     | `npm run format:check`               | all files formatted                             |
+| Android bundle               | `npx expo export --platform android` | **1340 modules** (was 1223)                     |
+| Migrations 0008, 0009        | `apply_migration`                    | both applied, first attempt                     |
+| Sign-up trigger path         | live SQL                             | name + postal code carried, FSA derived         |
+| Postal code privacy          | live SQL, impersonated               | FSA readable, full code `42501` denied          |
+| Avatar storage RLS           | live SQL, impersonated               | cross-folder write rejected, own-folder allowed |
+| FSA derivation               | live SQL                             | `M5V 2T6` → `M5V`, `M4K1N2` → `M4K`             |
+
+**The module count is meaningful this time.** In phase 2 the bundle stayed at
+1223 because nothing imported `src/services` — that run proved nothing. Now
+`RootNavigator` imports the screens, which import the hooks and services, so
+1340 modules means TanStack Query, `expo-image-picker`, `supabase-js`, `aes-js`
+and SecureStore all resolve and are reachable from the entry point.
+
+### A type-system bug worth recording
+
+`updateMyProfile` would not compile: `Argument of type 'ProfileUpdate' is not
+assignable to parameter of type 'never'`. Two causes, stacked, and both produce
+the same unhelpful `never`:
+
+1. **`messages: { Update: never }`.** supabase-js's `GenericTable` requires
+   `Update: Record<string, unknown>`. `never` fails that constraint, which
+   invalidates the whole schema and collapses `Update` to `never` for **every
+   table** — the error surfaced on `profiles`, which was fine. Changed to
+   `Record<string, never>`: still permits no properties, but satisfies the
+   constraint.
+2. **The row types were `interface`, not `type`.** TypeScript gives implicit
+   index signatures to type aliases but **not** to interfaces, so no `interface`
+   satisfies `Record<string, unknown>`. This is exactly why Supabase's generated
+   types use `type`. All 17 declarations in `database.ts` were converted.
+
+Diagnosed with a throwaway type probe asserting each table against a local copy
+of `GenericTable` — all seven assertions failed, which pointed at the shared
+cause rather than at `profiles`. Guessing at `Relationships: []` first did not
+help and was a wasted step.
+
+**For later phases:** keep `src/types/database.ts` using `type`, never
+`interface`, or `.update()` silently becomes uncallable across the app.
+
+### Manual testing — please run these
+
+`.env` is populated and the schema is live, so this should work end to end.
+Start with `npx expo start --clear` (env vars inline at build time) and open on
+your phone.
+
+**1. Sign up end to end, and confirm the row.**
+
+Welcome → Sign up. Enter a name, a real-format email, a password of 8+
+characters, and a postal code like `M5V 2T6`. Then verify in the dashboard
+(Table Editor → `profiles`, or SQL editor):
+
+```sql
+select id, display_name, postal_code, postal_fsa, bio, avatar_url, created_at
+from public.profiles order by created_at desc limit 1;
+```
+
+Expect `display_name` to match what you typed, `postal_code` stored as you
+entered it, and **`postal_fsa` to be the first three characters**. `bio` and
+`avatar_url` will be null until you complete onboarding.
+
+Note: nothing in the app writes that row — the database trigger does, from the
+sign-up metadata. If `display_name` is null, the metadata did not arrive; if
+`postal_fsa` is null but `postal_code` is set, the FSA trigger did not fire.
+Those are two different failures.
+
+**2. Postal code validation.** Try `12345`, `ZZZ 999`, and `D1A 1A1` (D is never
+used by Canada Post). All three should be rejected inline before submission,
+with the field showing an error rather than the form failing.
+
+**3. Wrong password.** Log in with a correct email and a wrong password. Expect
+_"That email and password combination does not match an account."_ — no crash,
+no red box.
+
+**4. Unknown email.** Log in with an address that has no account. Expect **the
+same message, word for word.** That is deliberate: a different message would let
+anyone test whether an address is registered. If you see a distinct "no such
+user" error, that is a regression.
+
+**5. Complete your profile.** After sign-up you should land on "Complete your
+profile", not Home.
+
+- **Add a photo** → permission prompt → pick an image. Confirm the avatar
+  updates. Then check Storage → `avatars`: the file must be at
+  `{your-user-id}/avatar.{ext}`, not at the bucket root.
+- Type a bio, **Save and continue** → lands on Home. Re-query `profiles` and
+  confirm both `bio` and `avatar_url` are set.
+- **Try a large image** (over 5 MB — a screenshot of a long page, or a burst
+  photo). Expect _"That image is N.N MB. Please choose one under 5 MB."_
+  **before** any upload progress appears.
+- **Skip for now** should also reach Home, leaving both fields null.
+
+**6. Force-quit and reopen — session persistence.** The stated test for this
+phase.
+
+- While signed in, fully force-quit the app (swipe away from the app switcher;
+  do **not** just background it).
+- Reopen. Expect a brief spinner, then **Home directly** — no welcome screen,
+  no re-login. The spinner is the session being decrypted from SecureStore +
+  AsyncStorage.
+- **Watch specifically for a flash of the Welcome screen.** `RootNavigator`
+  holds the spinner until the session resolves precisely to prevent that; if you
+  see the auth stack appear and then vanish, that guard has regressed.
+- Now sign out and force-quit again. Reopening should show **Welcome**, not
+  Home.
+
+**7. Onboarding is not re-shown.** Force-quit and reopen after completing a
+profile. You should land on Home, because `needsOnboarding` is derived from the
+profile row (photo or bio present) rather than a local flag — so it survives a
+reinstall too.
+
+### Known gaps
+
+- **No screen has been run on a device by me.** All screen verification above is
+  yours; what I verified is that it compiles, bundles, lints, and that the
+  database half behaves correctly under impersonation.
+- **The auth API round-trip has never executed.** Every database test used
+  direct SQL inserts into `auth.users`. `signUpWithEmail` and `signInWithEmail`
+  have still never been called against GoTrue, so the metadata hand-off is
+  verified at the _trigger_ end but not at the _client_ end. Step 1 is the first
+  real test of that.
+- **Email confirmation state is unknown.** I could not read the project's auth
+  settings with this token. If "Confirm email" is ON, sign-up will show _"Check
+  your email for a confirmation link"_ and will not enter the app — that is
+  handled, not a bug. Turn it off in the dashboard for smoother testing.
+- **Still no automated test runner.** Steps 3, 4 and 6 are exactly the
+  regression tests that should be automated first.
+- **No HEIC test.** The MIME allow-list includes it, but iOS HEIC uploads have
+  not been exercised — worth checking on an iPhone with HEIC capture enabled.
+- **The 3 SQL-created test users cannot sign in** through the auth API (no
+  `auth.identities` rows). Use a freshly signed-up account for steps 3–7.
