@@ -45,6 +45,12 @@ export type ProfileRow = {
    */
   postal_fsa: string | null;
   bio: string | null;
+  /**
+   * When the user last completed or skipped onboarding, or null if they never
+   * have. This is a different question from whether `avatar_url` and `bio` are
+   * filled in: both are optional, so their absence cannot stand in for it.
+   */
+  onboarded_at: Timestamptz | null;
   created_at: Timestamptz;
   updated_at: Timestamptz;
 };
@@ -63,6 +69,7 @@ export type ProfileUpdate = {
   /** Write-only: full code in, FSA out. See `ProfileRow.postal_fsa`. */
   postal_code?: string | null;
   bio?: string | null;
+  onboarded_at?: Timestamptz | null;
 };
 
 export type JobRow = {

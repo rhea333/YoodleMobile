@@ -11,7 +11,8 @@ import { supabase } from './supabase';
  */
 
 /** Columns a client is actually permitted to read. Keep in sync with 0008. */
-const PROFILE_COLUMNS = 'id, display_name, avatar_url, postal_fsa, bio, created_at, updated_at';
+const PROFILE_COLUMNS =
+  'id, display_name, avatar_url, postal_fsa, bio, onboarded_at, created_at, updated_at';
 
 export const AVATAR_BUCKET = 'avatars';
 
@@ -64,39 +65,69 @@ const EXTENSION_BY_MIME: Record<AllowedAvatarMimeType, string> = {
 const isAllowedMime = (value: string): value is AllowedAvatarMimeType =>
   (ALLOWED_AVATAR_MIME_TYPES as readonly string[]).includes(value);
 
+/** Only consulted when the picker could not determine a MIME type itself. */
+const MIME_BY_EXTENSION: Record<string, AllowedAvatarMimeType> = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+  heic: 'image/heic',
+  heif: 'image/heic',
+};
+
+const mimeFromUri = (uri: string): AllowedAvatarMimeType | undefined => {
+  const extension = /\.([a-z0-9]+)(?:[?#]|$)/i.exec(uri)?.[1]?.toLowerCase();
+  return extension ? MIME_BY_EXTENSION[extension] : undefined;
+};
+
 /**
  * Validate a picked image by declared type and size.
  *
- * Deliberately does NOT trust the file extension in the URI: a `.jpg` suffix
- * says nothing about the bytes. The picker's `mimeType` is used instead, and
- * the extension we store is derived from that MIME type rather than from the
- * incoming filename.
+ * `mimeType` and `fileSize` are both OPTIONAL in expo-image-picker's result —
+ * the SDK 57 types document the MIME type as absent "if could not be
+ * determined", and asset metadata is routinely missing under iOS's limited
+ * photo-library permission. Treating either absence as a rejection stranded
+ * those users behind a "please pick another" that no other photo would fix, so
+ * each one now degrades instead:
  *
- * This is still a client-side declaration and could be forged by a modified
- * client, which is why the bucket carries the same constraints.
+ *   - no MIME type -> fall back to the URI extension;
+ *   - no file size -> skip the check here, because `uploadMyAvatar` measures
+ *     the real bytes after reading them anyway.
+ *
+ * A DECLARED type outside the allow-list is still rejected outright; the
+ * extension is only a fallback, never an override. All of this is a
+ * client-side declaration that a modified client could forge, which is why the
+ * bucket enforces the same ceiling and allow-list itself (migration 0009).
  */
 export const validateAvatar = (image: PickedImage): AvatarValidation => {
-  const mimeType = image.mimeType?.toLowerCase();
+  const declared = image.mimeType?.toLowerCase();
+  let mimeType: AllowedAvatarMimeType | undefined;
+
+  if (declared !== undefined) {
+    if (!isAllowedMime(declared)) {
+      return { ok: false, message: 'Please choose a JPEG, PNG, WebP or HEIC image.' };
+    }
+    mimeType = declared;
+  } else {
+    mimeType = mimeFromUri(image.uri);
+  }
 
   if (!mimeType) {
-    return { ok: false, message: 'Could not tell what kind of file that is. Please pick another.' };
+    return {
+      ok: false,
+      message: 'Could not tell what kind of image that is. Please pick another.',
+    };
   }
 
-  if (!isAllowedMime(mimeType)) {
-    return { ok: false, message: 'Please choose a JPEG, PNG, WebP or HEIC image.' };
-  }
+  if (image.fileSize !== undefined) {
+    if (image.fileSize === 0) {
+      return { ok: false, message: 'That file appears to be empty. Please pick another.' };
+    }
 
-  if (image.fileSize === undefined) {
-    return { ok: false, message: 'Could not read that file’s size. Please pick another.' };
-  }
-
-  if (image.fileSize > MAX_AVATAR_BYTES) {
-    const mb = (image.fileSize / (1024 * 1024)).toFixed(1);
-    return { ok: false, message: `That image is ${mb} MB. Please choose one under 5 MB.` };
-  }
-
-  if (image.fileSize === 0) {
-    return { ok: false, message: 'That file appears to be empty. Please pick another.' };
+    if (image.fileSize > MAX_AVATAR_BYTES) {
+      const mb = (image.fileSize / (1024 * 1024)).toFixed(1);
+      return { ok: false, message: `That image is ${mb} MB. Please choose one under 5 MB.` };
+    }
   }
 
   return { ok: true, mimeType, extension: EXTENSION_BY_MIME[mimeType] };
@@ -208,8 +239,13 @@ export const uploadMyAvatar = async (
     return { ok: false, message: 'Could not read that image from your device.' };
   }
 
+  // The ACTUAL bytes, not the picker's claim about them — and the only size
+  // check that runs at all when the picker gave us no `fileSize`.
+  if (body.byteLength === 0) {
+    return { ok: false, message: 'That file appears to be empty. Please pick another.' };
+  }
+
   if (body.byteLength > MAX_AVATAR_BYTES) {
-    // Re-check the ACTUAL bytes, not the picker's claim about them.
     return { ok: false, message: 'That image is too large. Please choose one under 5 MB.' };
   }
 

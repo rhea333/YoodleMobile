@@ -774,3 +774,136 @@ reinstall too.
   not been exercised — worth checking on an iPhone with HEIC capture enabled.
 - **The 3 SQL-created test users cannot sign in** through the auth API (no
   `auth.identities` rows). Use a freshly signed-up account for steps 3–7.
+
+---
+
+## 2026-09-18 — Phase 3 audit: three fixes, and corrections to the tests above
+
+A verification pass over phase 3. The manual steps in the previous section are
+still the right ones to run, but **two of them asserted the wrong thing** — see
+"Corrections" below before using them.
+
+### Verified automatically
+
+- `npx tsc --noEmit` — clean.
+- `npx eslint .` — clean.
+- `npx prettier --check .` — clean.
+- `grep` over `/src` for `console.*`, Sentry and analytics calls — no hits.
+- `grep` over `/src` for `: any` / `as any` — no hits.
+- Git hygiene before the first commit: 68 files staged, confirmed to exclude
+  `node_modules/`, `.env` and `.expo/`.
+
+### Verified against the live database
+
+- **All ten migrations are applied**, including `0009_avatars_storage_bucket`,
+  whose file was missing from the repo and has been restored. See SECURITY.md.
+- **The `avatars` bucket** is public with `file_size_limit = 5242880` and the
+  four-MIME allow-list, and carries four owner-scoped policies on
+  `storage.objects`.
+- **All three triggers are live**: `on_auth_user_created` on `auth.users`,
+  `profiles_derive_postal_fsa` and `profiles_touch_updated_at` on
+  `public.profiles`. The deployed body of `app.handle_new_user` matches the
+  migration rather than an older version.
+- **Column grants match `PROFILE_COLUMNS`** in `/src/services/profiles.ts`, and
+  `postal_code` is genuinely not SELECT-able by `authenticated`.
+- **The canonicalisation trigger was exercised, not just read.** Wrote
+  `m4k1n2` to a test row; it came back `M4K 1N2` with `postal_fsa = M4K`. The
+  row was restored to its previous value afterwards.
+- **The backfill worked.** Every non-null `postal_code` in the table is now in
+  the spaced form; before this pass, sign-up-created rows were `M5V2T6` and
+  seeded rows were `M5V 2T6`.
+
+### A real bug the previous section's own tests would have caught
+
+Step 5 said _"Skip for now should also reach Home, leaving both fields null"_,
+and step 7 said onboarding is not re-shown after a restart. **Both could not be
+true at once.** Onboarding was inferred from "no photo and no bio", so a user
+who skipped left no trace and was returned to the screen on every cold start,
+forever. Fixed in migration 0010 with an `onboarded_at` column that both Save
+and Skip now write.
+
+Worth noting how it slipped through: each step was individually plausible, and
+the contradiction only appears when you run step 5 and step 7 _in sequence with
+the same account_. Test steps that share state need to be read as a sequence.
+
+### Corrections to the phase 3 manual tests
+
+Use these in place of what the previous section says:
+
+- **Step 1 — `postal_code`.** It said to expect the code "stored as you entered
+  it". That was never true and is now deliberately not true: the trigger
+  canonicalises to `M5V 2T6` regardless of spacing or case. Enter `m5v2t6` and
+  expect `M5V 2T6` back. `postal_fsa` should be `M5V`.
+- **Step 5 — Skip for now.** It should reach Home _and_ set `onboarded_at`.
+  Re-query and confirm the column is non-null while `bio` and `avatar_url` stay
+  null. That combination is the whole point of the column.
+- **Step 6 — signing out.** It said "now sign out and force-quit again". **There
+  is no sign-out in the app yet** (see the interim method below).
+
+### Interim sign-out, until phase 4
+
+`signOut()` exists in `/src/services/auth.ts` but nothing calls it, because the
+only signed-in screen is the phase-1 placeholder Home, which was out of scope.
+A sign-out control lands in phase 4. Until then, to get back to the auth stack
+you must clear the app's stored session from outside the app:
+
+- **Expo Go, either platform:** long-press the Yoodle entry in Expo Go's
+  project list and clear its data, or delete and re-add the project. Simplest
+  reliable option: delete Expo Go's app data entirely.
+- **Android (Expo Go or a dev build):** Settings → Apps → _Expo Go_ (or
+  _Yoodle_) → Storage → **Clear storage**. Not "Clear cache" — the session lives
+  in AsyncStorage and the Keychain/Keystore, which only "Clear storage" removes.
+- **iOS:** delete the app and reinstall. iOS has no per-app storage reset, and
+  note that **Keychain entries can survive a reinstall**, so if you still land
+  on Home after reinstalling, that is the SecureStore half persisting — expected,
+  not a bug.
+
+This clears the ciphertext and the AES key together, so the next launch reads no
+session and shows Welcome.
+
+### New manual tests for this pass
+
+**A. Skip persists.** Sign up a fresh account → land on "Complete your profile"
+→ **Skip for now** → Home. Force-quit, reopen. **Expect Home, not onboarding.**
+This is the fix; before it you would have seen the onboarding screen again.
+
+**B. Skip survives a failed write.** Harder to stage, but worth knowing the
+intent: if the `onboarded_at` write fails (turn off wifi just before tapping
+Skip), you should **still reach Home**. The cost is being asked again next
+launch. Nobody should ever be trapped in onboarding.
+
+**C. Photo with no metadata.** The case that motivated the validation change.
+On iOS, grant Yoodle **limited** photo access rather than full ("Select
+Photos…" → pick a couple). Then add a photo. It should **upload normally**.
+Previously this could fail with "Could not read that file's size. Please pick
+another." — advice that no other photo would have satisfied.
+
+**D. Oversized photo, still rejected.** Unchanged behaviour, but re-test it
+after the validation change: pick an image over 5 MB and expect the "That image
+is N.N MB" message _before_ any upload progress. If the picker gave no file
+size, the rejection instead arrives a moment later, from the byte-length check
+after the file is read — either is correct, and Storage would reject it anyway.
+
+**E. Mixed-case postal code.** Sign up with `m5v2t6` (no space, lowercase).
+Expect `M5V 2T6` in the row.
+
+### Known gaps
+
+Carried forward, plus changes:
+
+- **No screen has still been run on a device by me.** Everything above is either
+  a static check or a live SQL check. All screen behaviour is yours to verify.
+- **The auth API round-trip has still never executed from the app.** There are
+  now two sign-up-created rows in `profiles` (`display_name = 'yoodle'`) that
+  did not come from SQL, which suggests sign-up has been exercised at least
+  once — but not by me, and not observed end to end.
+- **`get_advisors` is still unavailable.** Run it first once the PAT scope is
+  widened, before phase 4 adds tables.
+- **Still no automated test runner.** Now more pressing: this pass found a
+  contradiction between two written test steps, which a runner would have
+  surfaced the first time both were run in sequence.
+- **No HEIC test.** Unchanged.
+- **Test C needs a real iPhone** with limited photo permission; it cannot be
+  staged in a simulator or on Android in the same way.
+- **The 3 SQL-created test users still cannot sign in** through the auth API.
+  Use a freshly signed-up account.

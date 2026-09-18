@@ -71,10 +71,13 @@ export const RootNavigator = () => {
     );
   }
 
-  // A profile with neither photo nor bio has not been through onboarding.
-  // Derived from the row rather than a local flag so it survives reinstalls.
+  // `onboarded_at` is set when the user either completes or SKIPS the screen.
+  // This used to be inferred from "no photo and no bio", but both fields are
+  // optional, so skipping persisted nothing and the screen came back on every
+  // cold start. Still derived from the row rather than a local flag, so it
+  // survives a reinstall.
   const profile = profileQuery.data;
-  const needsOnboarding = Boolean(session) && !profile?.avatar_url && !profile?.bio;
+  const needsOnboarding = Boolean(session) && !profile?.onboarded_at;
 
   return (
     <NavigationContainer theme={buildNavigationTheme(colors)}>

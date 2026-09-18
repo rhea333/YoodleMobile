@@ -556,3 +556,129 @@ message rather than inventing a more specific one.
 - **Test accounts still have known passwords** and were created via raw SQL.
 - **The MCP PAT is in this session's transcript** and should be rotated when
   prototype work ends.
+
+---
+
+## 2026-09-18 — Phase 3 audit: a lost migration, and two corrections
+
+A verification pass over phase 3 before starting phase 4. Nothing here is a
+breach; one finding is a real gap in what the repository could rebuild.
+
+### FINDING — the storage policies existed only in the live database
+
+`supabase/migrations/` ended at `0008`, but the project database had
+`0009_avatars_storage_bucket` applied. `/src/services/profiles.ts` referred to
+"migration 0009" twice and `0008`'s own header claimed it created the bucket, so
+the file had clearly been written and then lost before it was ever committed.
+
+Why this mattered, given the database itself was fine:
+
+- The `avatars` bucket, its 5 MB ceiling, its MIME allow-list and all four
+  owner-scoped RLS policies were reproducible from **nothing but the live
+  project**. A `supabase db reset`, a second environment, or a rebuild from the
+  repo would have produced a storage layer with no bucket and no policies.
+- That is precisely the half of the avatar defence that is supposed to survive a
+  modified client. The client-side checks in `profiles.ts` are a convenience;
+  the bucket constraints are the boundary. The boundary was undocumented.
+- It also means the security posture recorded in this file could not have been
+  re-derived from the repository — the claim and its enforcement had drifted
+  apart.
+
+Recovered verbatim from `supabase_migrations.schema_migrations` and restored as
+`0009_avatars_storage_bucket.sql`. Verified against the live project: bucket
+public with `file_size_limit = 5242880` and the four-MIME allow-list, and four
+policies on `storage.objects` scoping every write to
+`(storage.foldername(name))[1] = auth.uid()::text`. Not re-applied — the
+database was already correct.
+
+Worth generalising: a migration that is applied but uncommitted is invisible to
+every future reader, and this one carried an access-control rule.
+
+### Client-side photo validation relaxed — deliberately, and not a weakening
+
+`validateAvatar` previously rejected any picked image whose `mimeType` or
+`fileSize` the picker had not supplied. Both are optional in expo-image-picker's
+SDK 57 result, and are commonly absent under iOS's _limited_ photo-library
+permission. The failure text — "please pick another" — was unactionable in that
+state: no other photo would have helped either.
+
+It now falls back to the URI extension for the MIME type, and skips the size
+check when no size was given. The security reasoning for why that is acceptable:
+
+- **The client check was never the trust boundary.** Storage enforces the same
+  5 MB ceiling and the same MIME allow-list itself (migration 0009), on every
+  upload, regardless of what the app believes. A modified client could always
+  have lied about either field.
+- **A declared type outside the allow-list is still rejected outright.** The
+  extension is consulted only when nothing was declared; it can never override a
+  declaration. So the change cannot be used to smuggle a `image/gif` through by
+  renaming it.
+- **Size is now checked on the real bytes, not a claim.** `uploadMyAvatar`
+  measures `ArrayBuffer.byteLength` after reading the file and rejects both
+  oversized and zero-length payloads. That check is stronger than the one it
+  partially replaced, because the picker's `fileSize` was only ever a claim.
+
+Net effect: identical enforcement, fewer users stranded.
+
+### New column `onboarded_at` — user-controlled, and not an audit field
+
+Added in migration 0010 so that "Skip for now" persists. Two properties to
+record, because it is client-written:
+
+- **The value comes from the device clock** and the client may set it to
+  anything. Only _null vs not-null_ is ever read. It must not later be reused as
+  an audit timestamp, a rate-limiting input, or evidence of anything.
+- **Write access is scoped as usual.** `grant update (onboarded_at) ... to
+authenticated`, on top of the existing `profiles_update_self` RLS policy
+  (`id = auth.uid()`), so one user can only set it on their own row. Confirmed
+  in `information_schema.column_privileges`: `authenticated` has SELECT and
+  UPDATE on the column and nothing more.
+
+`anon` has no policy on `public.profiles` at all, so the vestigial table-level
+INSERT grant it holds on this column is unreachable.
+
+### Postal code canonicalisation changed no exposure
+
+Migration 0010 moved canonicalisation into `app.derive_postal_fsa`, so every
+write path now stores the Canada Post form (`M5V 2T6`). Previously the sign-up
+trigger stripped the space and a client UPDATE kept it, leaving two spellings in
+one column.
+
+No change to what is readable: `postal_code` still has SELECT revoked from
+`anon` and `authenticated`, `postal_fsa` is still the only public form, and the
+FSA is still trigger-derived rather than client-writable. The backfill rewrote
+existing rows in place through the same trigger, so there is one definition of
+"canonical" rather than two.
+
+### Confirmed unchanged from the phase 3 entry
+
+Re-verified rather than assumed:
+
+- **No logging surface exists at all.** `grep` over `/src` finds no
+  `console.*`, no Sentry, no analytics call of any kind. The claim that the
+  password never reaches a log holds structurally, not by discipline.
+- **No `any` anywhere in `/src`**, and `tsc --noEmit` is clean.
+- **`.env` is gitignored** (`.gitignore:34`), and the first commit was checked
+  file-by-file before it was made: no `.env`, no keys, no PAT. `.claude/`
+  contains only a plugin toggle.
+- **Session storage is still the `LargeSecureStore`** described in the phase 2
+  entry — AES-256 key per write in SecureStore, ciphertext in AsyncStorage.
+
+### Outstanding
+
+Carried forward, plus one closed:
+
+- **`get_advisors` is still unavailable** — the PAT lacks Project-level scope,
+  so Supabase's own security linter has never run against this schema, now
+  across three phases of DDL. **You are widening the PAT scope before phase 4**;
+  this should be the first thing run once it is, and before more tables land.
+- **No sign-out exists in the UI.** `signOut()` is implemented and exported but
+  nothing calls it, because the only signed-in screen is the phase-1 placeholder
+  Home. Deferred to phase 4. Until then the interim method is clearing the app's
+  storage — see TESTING.md. Note what this means for a shared or lost device
+  during testing: a session cannot currently be ended from inside the app.
+- **The avatars bucket is public.** Unchanged and still by design.
+- **A phantom storage row exists** from the phase 2 RLS test. Unchanged.
+- **Test accounts still have known passwords** and were created via raw SQL.
+- **The MCP PAT is in this session's transcript** and should be rotated when
+  prototype work ends — more pressing once its scope is widened.

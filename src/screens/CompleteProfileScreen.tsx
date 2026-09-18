@@ -39,9 +39,7 @@ export const CompleteProfileScreen = ({ navigation }: Props) => {
   const uploadAvatar = useUploadAvatarMutation(userId, {
     onSuccess: () => setLocalError(null),
   });
-  const updateProfile = useUpdateProfileMutation(userId, {
-    onSuccess: () => navigation.replace('Home'),
-  });
+  const updateProfile = useUpdateProfileMutation(userId);
 
   // The query is the source of truth until the user edits the field.
   const bioValue = bio ?? profileQuery.data?.bio ?? '';
@@ -100,10 +98,33 @@ export const CompleteProfileScreen = ({ navigation }: Props) => {
     });
   };
 
+  /**
+   * Marks onboarding as done. Written on BOTH paths, including "Skip for now" —
+   * photo and bio are optional, so their absence cannot record that the user
+   * has been here, and inferring it from them sent skippers back to this screen
+   * on every launch.
+   */
+  const onboardedNow = () => new Date().toISOString();
+
   const handleSave = () => {
     setLocalError(null);
     const trimmed = bioValue.trim();
-    updateProfile.mutate({ bio: trimmed.length > 0 ? trimmed : null });
+    updateProfile.mutate(
+      { bio: trimmed.length > 0 ? trimmed : null, onboarded_at: onboardedNow() },
+      { onSuccess: () => navigation.replace('Home') },
+    );
+  };
+
+  const handleSkip = async () => {
+    setLocalError(null);
+    try {
+      await updateProfile.mutateAsync({ onboarded_at: onboardedNow() });
+    } catch {
+      // Skipping must never trap anyone in onboarding, so a failed write is
+      // swallowed rather than surfaced. The only cost is being asked again on
+      // the next launch, which is the old behaviour anyway.
+    }
+    navigation.replace('Home');
   };
 
   const errorMessage =
@@ -179,9 +200,10 @@ export const CompleteProfileScreen = ({ navigation }: Props) => {
             size="lg"
           />
           <Button
+            disabled={updateProfile.isPending}
             fullWidth
             label="Skip for now"
-            onPress={() => navigation.replace('Home')}
+            onPress={() => void handleSkip()}
             variant="ghost"
           />
         </View>
