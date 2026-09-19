@@ -973,3 +973,83 @@ demo — purge fixtures and test accounts.** The procedure is in TESTING.md unde
   substitute.
 - **The avatars bucket is public** and **a phantom storage row exists** —
   unchanged.
+
+---
+
+## 2026-09-19 — `anon` blanket grants revoked (migration 0013)
+
+Closes the finding from the SQL audit earlier today.
+
+### What changed
+
+`revoke all privileges on all tables in schema public from anon`, then a
+re-grant of only the two reads that are deliberate and have policies behind
+them:
+
+- `select` on the twelve non-`location` columns of `jobs` (0003's list verbatim),
+  backing `jobs_select_published`.
+- `select` on `reviews`, backing `reviews_select_all`.
+
+`profiles`, `offers` and `messages` got nothing back. `anon` has no policy on
+any of them, so it could never read or write them; the grants were pure default
+residue.
+
+Revoke-then-regrant rather than revoking named privileges, so the result does
+not depend on which defaults each earlier migration happened to remove. What
+`anon` holds now is exactly the list above.
+
+### Verified after applying
+
+| Privilege  | jobs | profiles | offers | messages | reviews |
+| ---------- | ---- | -------- | ------ | -------- | ------- |
+| TRUNCATE   | no   | no       | no     | no       | no      |
+| DELETE     | no   | no       | no     | no       | no      |
+| INSERT     | no   | no       | no     | no       | no      |
+| TRIGGER    | no   | no       | no     | no       | no      |
+| REFERENCES | no   | no       | no     | no       | no      |
+
+Checked with `has_table_privilege` rather than by attempting the operations —
+attempting a TRUNCATE to confirm it fails is only safe if it fails.
+
+**No regression to anonymous browsing**, checked as the `anon` role:
+`browse_jobs(...)` → 50 rows, `nearby_job_categories(...)` → 5, published jobs
+readable → 56. `browse_jobs` is SECURITY INVOKER, so it reads `jobs` with the
+caller's own privileges and would have broken immediately had the re-grant been
+wrong.
+
+Note that `has_table_privilege('anon','public.jobs','SELECT')` now reports
+**false**. That is correct, not a regression: it tests _table-level_ SELECT,
+and `anon`'s access is column-level. Narrower is the point — the exact
+`location` column is excluded, and a table-level grant would have re-included it.
+
+### Future tables
+
+`alter default privileges in schema public revoke all on tables from anon`, so
+phase 5's tables do not arrive with the defaults again. Confirmed: the
+`postgres` default ACL for `public` tables no longer lists `anon`.
+
+**Limitation, recorded because it is invisible otherwise.** Default privileges
+attach to the role that CREATES the object. This covers tables created by
+`postgres` — migrations and the dashboard SQL editor, i.e. how tables actually
+get made here. The project also carries a `supabase_admin` default that still
+grants `anon` everything, and it cannot be altered from `postgres` (not a
+superuser, not a member). A table created _as `supabase_admin`_ would still
+inherit the old grants. Nothing creates tables that way today; worth
+re-checking with the audit query if that ever changes.
+
+### Still open: `authenticated` has the same defaults
+
+Deliberately out of scope for this change, which was scoped to `anon`.
+`authenticated` still holds TRUNCATE, DELETE, TRIGGER and REFERENCES on all five
+tables — verified `has_table_privilege('authenticated', ..., 'TRUNCATE')` is
+**true** everywhere.
+
+The same reasoning applies: RLS does not mediate TRUNCATE, so the grant is the
+only control. The difference is who holds it — any signed-in user rather than
+any visitor — which is a smaller population but not a trusted one. Same
+mitigation as before: PostgREST exposes no TRUNCATE verb, so it is latent.
+
+Doing it needs more care than the `anon` case, because `authenticated`
+legitimately needs INSERT/UPDATE/DELETE on several tables and the delete
+policies in 0003–0006 have to be read first to work out the correct re-grant
+list. Worth folding into phase 5 alongside its new tables rather than rushing.

@@ -1234,3 +1234,38 @@ the Toronto fixture setup, the pagination tie-break, location-permission denial,
 wildcard search, and map clustering. Nothing in this follow-up changes how any
 of them behave — the only user-visible difference is the extra dev-only `▦`
 button in the Home header.
+
+---
+
+## 2026-09-19 — `anon` grants revoked: what to re-check
+
+Migration `0013` revoked Supabase's default table grants from `anon`. Full
+detail in SECURITY.md; what matters for testing is that it touches the
+privileges `browse_jobs` depends on, so a mistake here would break browsing for
+signed-out visitors rather than fail loudly at migration time.
+
+**Already verified as the `anon` role**, after applying: `browse_jobs(...)` →
+50 rows, `nearby_job_categories(...)` → 5, published jobs readable → 56, and
+TRUNCATE/DELETE/INSERT/TRIGGER/REFERENCES all denied on all five tables.
+
+**Nothing changes for the app's own manual tests.** Yoodle always has a session
+on the main stack, so every screen runs as `authenticated`, which this migration
+did not touch. The phase 4 manual tests stand exactly as written.
+
+**Re-run the audit query after phase 5 adds tables.** New tables created by
+`postgres` will no longer inherit `anon` grants, but this is worth confirming
+rather than assuming:
+
+```sql
+select t.table_name,
+       has_table_privilege('anon', 'public.'||t.table_name, 'TRUNCATE') as anon_truncate,
+       has_table_privilege('anon', 'public.'||t.table_name, 'INSERT')   as anon_insert,
+       has_table_privilege('anon', 'public.'||t.table_name, 'DELETE')   as anon_delete
+from information_schema.tables t
+where t.table_schema='public' and t.table_type='BASE TABLE'
+order by t.table_name;
+```
+
+Every column should read `false`. Any `true` means a table was created by a
+role whose default privileges still grant `anon` — see the limitation noted in
+SECURITY.md.
