@@ -177,6 +177,31 @@ export const getMyProfile = async (userId: Uuid): Promise<ProfileResult> => {
 };
 
 /**
+ * Any user's profile, by id.
+ *
+ * Used for the poster summary on a job detail screen. `profiles_select_authenticated`
+ * lets any signed-in user read any profile row, but only through the column
+ * grants from 0008 — so this returns a display name, photo, bio and FSA, and
+ * cannot return the full postal code no matter who asks.
+ *
+ * `maybeSingle` rather than `single`: a job whose poster row has gone is a
+ * missing summary, not an error worth failing the screen over.
+ */
+export const getProfileById = async (userId: Uuid): Promise<ProfileResult> => {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select(PROFILE_COLUMNS)
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (error || !data) {
+    return { ok: false, message: 'Could not load that profile.' };
+  }
+
+  return { ok: true, profile: data };
+};
+
+/**
  * Patch the signed-in user's profile.
  *
  * RLS restricts this to the caller's own row, and column grants restrict it to

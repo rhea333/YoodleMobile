@@ -3,7 +3,7 @@ import {
   type NativeStackNavigationOptions,
 } from '@react-navigation/native-stack';
 
-import { CompleteProfileScreen, HomeScreen } from '../screens';
+import { CompleteProfileScreen, DesignSystemScreen, HomeScreen, JobDetailScreen } from '../screens';
 import type { MainStackParamList } from './types';
 
 const Stack = createNativeStackNavigator<MainStackParamList>();
@@ -34,5 +34,18 @@ export const MainNavigator = ({ needsOnboarding, screenOptions }: MainNavigatorP
       options={{ title: 'Your profile' }}
     />
     <Stack.Screen component={HomeScreen} name="Home" options={{ title: 'Yoodle' }} />
+    <Stack.Screen component={JobDetailScreen} name="JobDetail" options={{ title: 'Job' }} />
+    {/*
+      Dev-only. `__DEV__` is false in a release bundle, so this route is simply
+      absent there rather than merely unlinked — there is nothing to deep-link
+      or guess your way into.
+    */}
+    {__DEV__ ? (
+      <Stack.Screen
+        component={DesignSystemScreen}
+        name="DesignSystem"
+        options={{ title: 'Design system (dev)' }}
+      />
+    ) : null}
   </Stack.Navigator>
 );

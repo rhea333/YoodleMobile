@@ -47,7 +47,8 @@ begin
     'published'
   );
 
-  -- A DRAFT at City Hall. Must NEVER appear in nearby_jobs for anyone but A.
+  -- A DRAFT at City Hall. Must NEVER appear in browse results for anyone,
+  -- including A: browse_jobs filters on status rather than trusting RLS.
   insert into public.jobs (poster_id, title, category, budget, location, status)
   values (
     user_a, 'Draft job - should stay hidden', 'outdoor', 10.00,
@@ -75,20 +76,56 @@ select title, coarse_lat, coarse_long
 from public.jobs
 order by title;
 
+-- These three checks used to go through public.nearby_jobs(). That function was
+-- dropped in migration 0012 (superseded by browse_jobs, and an uncapped,
+-- draft-leaking endpoint in its own right). They now hit public.jobs directly,
+-- which keeps them as GROUND TRUTH: browse_jobs deliberately hides drafts, so
+-- running these through it would defeat the point of the draft row below.
+
 -- 5 km radius from City Hall.
 -- EXPECT exactly 3 rows: 'Shovel my driveway' (~0 m),
 --   'Assemble a bookshelf' (~1.4 km), and 'Draft job - should stay hidden'
 --   (~0 m) — the draft appears HERE only because the service role bypasses RLS.
-select title, round(distance_meters) as metres
-from public.nearby_jobs(43.6532, -79.3832, 5000)
-order by distance_meters;
+select
+  title,
+  round(extensions.st_distance(
+    location_coarse,
+    extensions.st_setsrid(extensions.st_point(-79.3832, 43.6532), 4326)::extensions.geography
+  )) as metres
+from public.jobs
+where location_coarse is not null
+  and extensions.st_dwithin(
+    location_coarse,
+    extensions.st_setsrid(extensions.st_point(-79.3832, 43.6532), 4326)::extensions.geography,
+    5000)
+order by metres;
 
 -- 20 km radius: EXPECT all 4 rows, Scarborough last at ~11 km.
-select title, round(distance_meters) as metres
-from public.nearby_jobs(43.6532, -79.3832, 20000)
-order by distance_meters;
+select
+  title,
+  round(extensions.st_distance(
+    location_coarse,
+    extensions.st_setsrid(extensions.st_point(-79.3832, 43.6532), 4326)::extensions.geography
+  )) as metres
+from public.jobs
+where location_coarse is not null
+  and extensions.st_dwithin(
+    location_coarse,
+    extensions.st_setsrid(extensions.st_point(-79.3832, 43.6532), 4326)::extensions.geography,
+    20000)
+order by metres;
 
 -- 500 m radius: EXPECT 2 rows (City Hall job + the draft), NOT the bookshelf.
-select title, round(distance_meters) as metres
-from public.nearby_jobs(43.6532, -79.3832, 500)
-order by distance_meters;
+select
+  title,
+  round(extensions.st_distance(
+    location_coarse,
+    extensions.st_setsrid(extensions.st_point(-79.3832, 43.6532), 4326)::extensions.geography
+  )) as metres
+from public.jobs
+where location_coarse is not null
+  and extensions.st_dwithin(
+    location_coarse,
+    extensions.st_setsrid(extensions.st_point(-79.3832, 43.6532), 4326)::extensions.geography,
+    500)
+order by metres;

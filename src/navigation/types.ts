@@ -15,6 +15,15 @@ export type AuthStackParamList = {
 export type MainStackParamList = {
   CompleteProfile: undefined;
   Home: undefined;
+  /** `jobId` only — the screen fetches the job rather than being handed it, so
+   *  a stale list row cannot render as if it were current. */
+  JobDetail: { jobId: string };
+  /**
+   * DEV ONLY. The component gallery kept from phase 1. `MainNavigator`
+   * registers this route only when `__DEV__`, so navigating to it in a release
+   * build is not possible — the route does not exist there.
+   */
+  DesignSystem: undefined;
 };
 
 /**

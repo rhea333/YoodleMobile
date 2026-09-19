@@ -907,3 +907,330 @@ Carried forward, plus changes:
   staged in a simulator or on Android in the same way.
 - **The 3 SQL-created test users still cannot sign in** through the auth API.
   Use a freshly signed-up account.
+
+---
+
+## 2026-09-18 — Phase 4: job browsing
+
+### Verified automatically
+
+- `npx tsc --noEmit`, `npx eslint .`, `npx prettier --check .` — all exit 0.
+- **`npx expo export --platform ios` succeeds**, 1394 modules. This is the check
+  that matters for a phase that adds two native modules: it proves
+  `react-native-maps` and `expo-location` actually resolve in the bundle, not
+  just in the type checker.
+
+### Verified against the live database
+
+All of the following ran as SQL against the real project, most of it while
+impersonating a signed-in user rather than as an admin.
+
+**Radius filtering is exact.** With a 10 km radius from 43.65,−79.38 the
+returned set stops at the job seeded at 8.89 km. The jobs at 11.11 km, 16.68 km
+and 38.9 km are absent, as is `Dog walking in Scarborough` at ~11.2 km.
+
+**Pagination neither duplicates nor skips.** Three pages of 20 over 52 in-range
+jobs: 20 + 20 + 12 = 52 returned, 52 distinct, 0 in-range rows missing from the
+pages, 0 rows returned from outside the radius, and page 4 empty. This ran
+against a deliberately hostile fixture — 45 jobs at one identical coarse point,
+so every page boundary falls inside a group of tied distances.
+
+**The caps bind.** `p_limit` 9 999 → 50 rows; 0 and −5 → 1 row. `p_offset`
+99 999 → 0 rows. `p_radius_meters` 9 999 999 → clamped to 50 km; 1 → clamped to
+500 m. The limit ceiling only becomes meaningful once the fixture exceeds 50
+in-range rows, which is why the tie cluster is 45 rather than 5.
+
+**Wildcards are escaped.** Searching `%` → 0 rows. Searching `_` → 0 rows. A
+normal search still works and is case-insensitive (`SHOVEL` → 1).
+
+**Drafts do not leak.** Impersonating the poster who owns the drafts:
+`nearby_jobs` → 2 drafts, `browse_jobs` → 0. See SECURITY.md.
+
+**The exact location is unreachable.** Impersonating a signed-in
+non-participant: `select location from public.jobs` → _permission denied for
+table jobs_; `job_exact_location(...)` → 0 rows; `browse_jobs(...)` → 50 rows.
+Browsing works while the address stays shut.
+
+### Test data
+
+`supabase/tests/seed_browse_jobs.sql` — idempotent, re-runnable, and it only
+touches rows whose title starts with `Seed `. It has already been applied.
+
+Every seeded point sits exactly on the 2-decimal-place grid, so the coarse
+rounding is a no-op and the distances below are the distances the app will
+show. Seeding at an arbitrary coordinate would round it and move the job by up
+to ~800 m, which would make a radius test unreadable.
+
+| Seeded job                       | Distance from 43.65,−79.38 | In the default 10 km radius? |
+| -------------------------------- | -------------------------- | ---------------------------- |
+| `Seed 000m - same block`         | ~0 m                       | yes                          |
+| `Seed tie 01` … `Seed tie 45`    | 1.11 km (all identical)    | yes                          |
+| `Seed 1.1km - one grid north`    | 1.11 km                    | yes                          |
+| `Seed 2.2km - two grids`         | 2.22 km                    | yes                          |
+| `Seed 5.6km - five grids`        | 5.56 km                    | yes                          |
+| `Seed 8.9km - inside 10km`       | 8.89 km                    | yes — the last one in        |
+| `Seed 11.1km - outside 10km`     | 11.11 km                   | **no**                       |
+| `Seed 16.7km - well outside`     | 16.68 km                   | **no**                       |
+| `Seed 38.9km - far outside`      | 38.9 km                    | **no**                       |
+| `Seed DRAFT - must never appear` | 1.11 km                    | **no** — unpublished         |
+
+Totals: 56 published jobs, 52 of them within 10 km of the reference point.
+
+### READ THIS FIRST: the seeded jobs are in Toronto
+
+The browse radius is centred on **your device's GPS position**, not on your
+profile's postal code. If you are not physically near 43.65,−79.38 then **every
+test below will show an empty list** — correctly, because there genuinely are
+no jobs near you.
+
+If you are not in downtown Toronto, move the fixture to you first. Get your own
+coordinates from any maps app, round them to 2 decimal places, and edit only
+the first line of this:
+
+```sql
+with me as (select 43.65::float as lat, -79.38::float as long)  -- <-- YOUR rounded lat/long
+update public.jobs j
+   set location = extensions.st_setsrid(
+         extensions.st_point(
+           extensions.st_x(j.location::extensions.geometry) + (me.long - (-79.38)),
+           extensions.st_y(j.location::extensions.geometry) + (me.lat  -   43.65)
+         ), 4326)::extensions.geography
+  from me
+ where j.title like 'Seed %';
+```
+
+It shifts the whole fixture by the offset between the Toronto centre and yours,
+so every relative distance in the table above stays intact. Re-running
+`seed_browse_jobs.sql` puts the Toronto originals back.
+
+### Manual testing — please run these
+
+Start with `npx expo start --clear` and open on your phone.
+
+**1. Location permission.** First launch of the new Home screen prompts for
+location. Expect the prompt to mention that your position is rounded to about a
+kilometre — that string lives in `app.json`, so a generic "Allow Yoodle to use
+your location" instead means the plugin config did not apply.
+
+- **Deny it.** Expect an explanation and a **Try again** button — not an empty
+  list, not a crash. There is deliberately no manual-entry fallback yet.
+- **Grant it**, then tap Try again. The list should populate.
+
+**2. Radius.** With the fixture centred on you, scroll the whole list. Expect
+`Seed 8.9km - inside 10km` to be present and the 11.1 km, 16.7 km and 38.9 km
+jobs to be absent. The footer should read _"That's everything within 10 km."_
+
+**3. Pagination.** The one worth doing carefully.
+
+- Scroll to the bottom. A spinner should appear and ~20 more jobs load.
+- Keep going until the footer message appears. You should reach **52 jobs**.
+- **Watch the `Seed tie NN` numbers as you cross each page boundary.** They all
+  sit at an identical distance, which is exactly where offset pagination breaks
+  if the ordering is not a total order. Every number 01–45 should appear
+  **once**. A repeat, or a gap, is the bug the ordering exists to prevent.
+
+**4. Empty state.** The list is empty when nothing is near _the phone_, so a new
+account alone will not produce it — the account is not what the radius keys on.
+The reliable way is to hide the jobs:
+
+```sql
+-- Hide everything, check the app, then put it back.
+update public.jobs set status = 'draft' where status = 'published';
+```
+
+```sql
+-- Restore afterwards.
+update public.jobs set status = 'published'
+ where title like 'Seed %' and title not like '%DRAFT%';
+```
+
+Pull to refresh in the app between the two. Expect **"No jobs near you yet"**
+with the _"Nobody within 10 km has posted an open job"_ subtitle, and **no Clear
+filters button** — that belongs only on the filtered empty state.
+
+Then check the other empty: with jobs restored, search for `zzzzz`. Expect
+**"Nothing matches those filters"** _with_ a Clear filters button. Getting these
+two the wrong way round would send someone hunting for a control that cannot
+help them.
+
+**5. Search and categories.**
+
+- Type `shovel`. The list should narrow when you stop typing, not on every
+  keystroke — there is a 300 ms debounce.
+- Type `%`. Expect **no results**, not every job. This is the wildcard escaping.
+- Tap a category chip, then tap it again to deselect. The counts on the chips
+  should match what the filtered list actually contains.
+- Combine a category with a search term; both should apply.
+
+**6. Map view.** Tap **Map**.
+
+- Expect pins at neighbourhood positions. The 45-job cluster should be a single
+  pin reading **"45 jobs in this area"**, not 45 stacked pins — locations are
+  rounded to ~1 km, so many jobs genuinely share a coordinate.
+- Tap that pin's callout → it should switch back to the list.
+- Tap a single-job pin's callout → it should open that job's detail screen.
+- Sanity-check the privacy claim: no pin should sit on a plausible street
+  address. They should all land on a rounded grid.
+
+**7. Job detail.** Tap any job.
+
+- Expect title, category, budget, description, and the poster's name, photo,
+  bio and FSA ("M5V area").
+- **There should be no map and no address anywhere on this screen.**
+- The **Apply** button is disabled by design.
+
+**8. Sign out.** The control is on Home, top right. This closes the interim
+storage-clearing workaround documented last phase.
+
+- Tap it → you should land back on Welcome.
+- Sign in as a different account → you should **not** see a flash of the
+  previous account's job list or profile, because the query cache is cleared on
+  sign-out.
+
+### Known gaps
+
+- **Still no screen run on a device by me.** Everything above is a static check,
+  a bundle check, or a live SQL check.
+- **The map is untested on Android**, which needs a Google Maps API key for any
+  build outside Expo Go. On iOS it uses Apple Maps and needs nothing.
+- **`npm run web` will not render the map.** `react-native-maps` ships no web
+  entry point, so importing it under the web bundler is expected to fail. Web
+  was never part of the verified testing route; noted so the failure is not
+  mistaken for a regression.
+- **The empty state cannot be tested by account**, only by moving the phone or
+  unpublishing the fixture. That follows from keying the radius on GPS.
+- **`get_advisors` still unavailable.** Two new functions this phase, still
+  unlinted.
+- **Still no automated test runner.** Step 3 is a hand-run version of something
+  that should be a query-level regression test — it is exactly the kind of
+  ordering bug that comes back silently.
+- **The >500 offset behaviour is untested in the app.** The cap is verified in
+  SQL, but reaching it through the UI needs more than 500 in-range jobs.
+
+---
+
+## 2026-09-19 — Phase 4 follow-up: cleanup, and a fixture purge you must not skip
+
+### Purging fixture data — REQUIRED before any real signup
+
+**Read this before you invite anyone, build for store review, or demo the app.**
+
+The project database currently contains **56 published fixture jobs**, all
+owned by test accounts, all clustered on downtown Toronto, plus test profiles
+with known passwords created by raw SQL in phase 2. In the UI a fixture job is
+indistinguishable from a real one. A first real user would open Yoodle and find
+a neighbourhood full of listings nobody will ever respond to.
+
+This is tracked in SECURITY.md as a **release blocker**, not a tidiness item.
+
+**Step 1 — see what is fixture.** Everything seeded by this project is
+identifiable:
+
+```sql
+select
+  count(*) filter (where title like 'Seed %')                    as browse_fixtures,
+  count(*) filter (where title in (
+    'Shovel my driveway','Assemble a bookshelf',
+    'Dog walking in Scarborough','Draft job - should stay hidden'))as phase2_fixtures,
+  count(*)                                                        as all_jobs
+from public.jobs;
+```
+
+If `browse_fixtures + phase2_fixtures` is less than `all_jobs`, **stop** —
+something real is in there and the blanket delete below is wrong.
+
+**Step 2 — remove fixture jobs.**
+
+```sql
+delete from public.jobs
+ where title like 'Seed %'
+    or title in ('Shovel my driveway','Assemble a bookshelf',
+                 'Dog walking in Scarborough','Draft job - should stay hidden');
+```
+
+**Step 3 — remove the test accounts.** Deleting from `auth.users` cascades to
+`public.profiles` via the foreign key, and on to their jobs, offers, messages
+and reviews.
+
+```sql
+-- Check the list first. Do NOT run the delete without reading this output.
+select id, email, created_at from auth.users order by created_at;
+```
+
+```sql
+delete from auth.users where email in ( /* ...the test addresses from above... */ );
+```
+
+The three phase-2 accounts (`Account A`, `Account B`, `Account C (outsider)`)
+and `Dana Onboard` were created by SQL and have known passwords. The two
+`yoodle` profiles came from real sign-ups through the app. All of them are test
+data.
+
+**Step 4 — confirm empty.** `select count(*) from public.jobs;` should be 0, and
+the app should show **"No jobs near you yet"**, which doubles as a live check of
+the unfiltered empty state.
+
+**Step 5 — rotate the MCP PAT** (SECURITY.md), since it has been in transcripts.
+
+### `nearby_jobs` removed — what changed for testing
+
+Migration `0012` drops `public.nearby_jobs`. Nothing in the app used it.
+
+Three ground-truth queries at the bottom of `supabase/tests/seed_test_data.sql`
+did, and they have been rewritten to query `public.jobs` directly with
+`ST_DWithin`/`ST_Distance`. That is deliberate rather than switching them to
+`browse_jobs`: those checks exist to prove the draft row _is_ present for the
+service role, and `browse_jobs` filters drafts by design, so running them
+through it would have quietly defeated the test.
+
+Verified after the drop: the 500 m ground-truth query still returns exactly the
+two expected rows (`Shovel my driveway` and `Draft job - should stay hidden`, both
+439 m), and `public` now exposes exactly three functions — `browse_jobs`,
+`nearby_job_categories`, `job_exact_location`.
+
+### The design system gallery is back, on a dev-only route
+
+Phase 4 replaced the phase-1 placeholder Home with the real job browser, which
+removed the only screen where every component is rendered together against the
+real palette. That gallery is the thing that makes a contrast or spacing
+regression visible, so it has been restored as
+`src/screens/DesignSystemScreen.tsx` — the phase-1 body carried over unchanged.
+
+**How to reach it:** in a dev build, a small `▦` button sits to the left of
+**Sign out** in the Home header. Tap it.
+
+**Why it is not a shipped feature:** both the route registration in
+`MainNavigator` and the button in `HomeScreen` are wrapped in `__DEV__`. In a
+release bundle the route does not exist, so there is nothing to deep-link or
+guess into — it is absent rather than merely unlinked. If you want to confirm
+that, the check is that `__DEV__` appears in both files.
+
+When you run the contrast re-audit from the 2026-09-14 section, this is the
+screen to run it against.
+
+### Verified automatically after these changes
+
+- `npx tsc --noEmit` — exit 0. This also confirms nothing still references the
+  deleted `NearbyJobRow` type or the `nearby_jobs` entry in `Database`.
+- `npx eslint .` — exit 0.
+- `npx prettier --check .` — exit 0.
+
+### Security audit run as SQL
+
+`get_advisors` is still refused, but the underlying lint rules were run
+directly against the catalog — RLS coverage, function `search_path`, definer
+views, extension placement, primary keys, and what `anon` can reach. Results and
+the one finding are in SECURITY.md under the 2026-09-19 entry. Summary: RLS,
+search_path, views and extensions are all clean; `anon` retains Supabase's
+default blanket table grants, of which **TRUNCATE is not covered by RLS**.
+
+Re-run that audit when phase 5 adds tables — new tables inherit the same
+defaults.
+
+### Still to do by hand (unchanged from the phase 4 entry)
+
+The phase 4 manual tests have not been superseded and still need running:
+the Toronto fixture setup, the pagination tie-break, location-permission denial,
+wildcard search, and map clustering. Nothing in this follow-up changes how any
+of them behave — the only user-visible difference is the extra dev-only `▦`
+button in the Home header.

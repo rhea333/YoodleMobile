@@ -177,16 +177,32 @@ export type ReviewUpdate = {
   comment?: string | null;
 };
 
-/** One row of `public.nearby_jobs(...)`. */
-export type NearbyJobRow = {
+/**
+ * One row of `public.browse_jobs(...)` — the paginated browse read.
+ *
+ * `lat`/`long` are the COARSE point, rounded to ~1 km. There is deliberately no
+ * field here for the exact one: it is not in the function's result and its
+ * column is not readable, so a browse screen cannot render a precise pin even
+ * by mistake. Reaching the exact point requires `job_exact_location`, which is
+ * for the poster and the accepted worker only.
+ */
+export type BrowseJobRow = {
   id: Uuid;
+  poster_id: Uuid;
   title: string;
+  description: string | null;
   category: string;
   budget: number | null;
-  status: JobStatus;
   lat: number;
   long: number;
   distance_meters: number;
+  created_at: Timestamptz;
+};
+
+/** One row of `public.nearby_job_categories(...)`, for the filter chips. */
+export type JobCategoryCount = {
+  category: string;
+  job_count: number;
 };
 
 export type Database = {
@@ -217,13 +233,25 @@ export type Database = {
     };
     Views: Record<string, never>;
     Functions: {
-      nearby_jobs: {
-        Args: { p_lat: number; p_long: number; p_radius_meters: number };
-        Returns: NearbyJobRow[];
-      };
       job_exact_location: {
         Args: { p_job_id: Uuid };
         Returns: LatLong[];
+      };
+      browse_jobs: {
+        Args: {
+          p_lat: number;
+          p_long: number;
+          p_radius_meters?: number;
+          p_category?: string | null;
+          p_search?: string | null;
+          p_limit?: number;
+          p_offset?: number;
+        };
+        Returns: BrowseJobRow[];
+      };
+      nearby_job_categories: {
+        Args: { p_lat: number; p_long: number; p_radius_meters?: number };
+        Returns: JobCategoryCount[];
       };
     };
     Enums: {

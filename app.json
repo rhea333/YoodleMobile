@@ -23,6 +23,14 @@
       "bundler": "metro"
     },
     "scheme": "yoodle",
-    "plugins": ["expo-secure-store"]
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Yoodle uses your location to show odd jobs posted near you. Your position is rounded to about a kilometre before it is sent."
+        }
+      ]
+    ]
   }
 }

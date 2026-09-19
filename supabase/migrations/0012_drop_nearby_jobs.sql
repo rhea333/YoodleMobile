@@ -1,0 +1,26 @@
+-- 0012_drop_nearby_jobs.sql
+-- Yoodle — retire the unpaginated, unfiltered radius search.
+--
+-- `nearby_jobs` was superseded by `browse_jobs` (0011) and has no caller left:
+-- nothing in /src references it, and the only remaining uses were three
+-- ground-truth queries in supabase/tests/seed_test_data.sql, rewritten in the
+-- same change to hit public.jobs directly.
+--
+-- WHY DROP IT RATHER THAN LEAVE IT:
+--
+-- It is not dead code, it is a live, EXECUTABLE endpoint granted to anon and
+-- authenticated. Anyone holding the publishable key can call it over PostgREST
+-- whether or not the app does. And it has the two properties browse_jobs was
+-- written to avoid:
+--
+--   1. NO STATUS FILTER. It inherits visibility from RLS, and `jobs_select_own`
+--      lets a poster read their own drafts — so it hands a caller their
+--      unpublished jobs mixed in with live ones. Verified: it returned 2 drafts
+--      to their poster where browse_jobs returned 0.
+--   2. NO PAGINATION OR CAPS. One call returns every job in the radius, which
+--      is exactly the bulk-extraction path the caps in 0011 exist to close.
+--
+-- Leaving it in place would mean the anti-scrape work in 0011 could be stepped
+-- around by calling the older function instead. Dropping it is the point.
+
+drop function if exists public.nearby_jobs(float, float, float);

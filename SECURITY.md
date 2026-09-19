@@ -682,3 +682,294 @@ Carried forward, plus one closed:
 - **Test accounts still have known passwords** and were created via raw SQL.
 - **The MCP PAT is in this session's transcript** and should be rotated when
   prototype work ends — more pressing once its scope is widened.
+
+---
+
+## 2026-09-18 — Phase 4: browsing, and what a browser can work out
+
+Phase 4 is the first screen that shows OTHER people's data to a stranger, so
+the questions here are different from phases 1–3: not "can this account be
+broken into" but "what can someone learn by scrolling".
+
+### A browser sees a neighbourhood, never an address
+
+The requirement was to confirm the list and map expose only neighbourhood-level
+location until an offer is accepted. Confirmed at four independent layers, and
+tested rather than reasoned about:
+
+1. **The function does not select it.** `browse_jobs` (migration 0011) returns
+   `coarse_lat`/`coarse_long` — the ~1 km rounded point from 0003 — and has no
+   parameter or column that could return the exact one.
+2. **The column is not readable.** SELECT on `jobs.location` is revoked from
+   `anon` and `authenticated`. Verified live: impersonating an ordinary signed-in
+   user, `select location from public.jobs` fails with _permission denied for
+   table jobs_. Not filtered — refused.
+3. **The escape hatch checks authorisation.** `job_exact_location()` returned
+   **0 rows** for a signed-in user who is neither the poster nor an accepted
+   worker, while `browse_jobs` returned 50 for the same user. Browsing works;
+   the exact point does not come with it.
+4. **The type system will not carry it.** `BrowseJobRow` has `lat`/`long` and no
+   field for an exact point, so a component cannot render one by mistake.
+
+The detail screen deliberately has **no map and no address at all** — only the
+poster's FSA ("M5V area"), which is already the public form.
+
+**A trilateration angle, considered and dismissed.** A client can call
+`browse_jobs` with any centre it likes and read `distance_meters`, so it can
+solve for a job's exact position by varying the centre. That is fine here: the
+position it solves for is the COARSE point, which the same response already
+hands over as `lat`/`long`. Nothing is gained. This would stop being true if
+`distance_meters` were ever computed from `location` instead of
+`location_coarse` — a one-word change in 0011 that would silently turn the
+browse endpoint into an address oracle. Worth a comment if that code is touched.
+
+**`formatDistance` rounds sub-kilometre distances to the nearest 50 m.** Partly
+presentational, partly not: "437 m away" states a precision the underlying data
+does not have and invites a user to treat it as a fix on the address.
+
+### The user's own location is protected too, which was not asked for
+
+The radius centre comes from device GPS. That makes the browsing user's
+position a new piece of sensitive data the app did not previously handle, so
+`useBrowseLocation` constrains it at the source:
+
+- **Accuracy is requested as `Accuracy.Low` (~1 km), not `High`.** The feature
+  needs a neighbourhood, so collecting a street-level fix would mean holding
+  more precision than anything uses. The cheapest way not to leak data is not to
+  collect it.
+- **The fix is rounded to 2 decimal places (~1 km) before it leaves the hook**,
+  onto the same grid job locations are snapped to. The server therefore never
+  receives a precise user position — only a neighbourhood. Nothing downstream
+  can leak what it was never sent.
+- **It is never persisted.** The coordinates live in component state for the
+  session and are not written to the database, to storage, or to the profile.
+
+Permission copy is explicit about the rounding rather than generic, in
+`app.json`'s `expo-location` plugin config.
+
+### Anti-scraping: pagination caps, and their honest limits
+
+`browse_jobs` clamps all three of its size parameters **server-side**, so a
+caller that sends whatever it likes gains nothing:
+
+| Parameter         | Clamped to     | Verified                                     |
+| ----------------- | -------------- | -------------------------------------------- |
+| `p_radius_meters` | 500 m .. 50 km | 9 999 999 → 50 km results; 1 → 500 m results |
+| `p_limit`         | 1 .. 50        | 9 999 → 50 rows; 0 and −5 → 1 row            |
+| `p_offset`        | 0 .. 500       | 99 999 → 0 rows                              |
+
+The offset ceiling is the load-bearing one. A limit alone only changes how many
+requests a scraper makes, not what it can ultimately reach; the offset cap means
+roughly 550 rows is the most any single (centre, radius, filter) combination can
+yield.
+
+**What this does NOT do, stated plainly:** it is not rate limiting. A determined
+scraper can still walk the map by moving the centre and re-querying, and nothing
+here counts requests or throttles them. What the caps prevent is casual bulk
+extraction — one call that returns the city. Real rate limiting belongs at the
+edge (Supabase/PostgREST or a gateway) and is not something an RPC can do well.
+Logged as outstanding rather than claimed as solved.
+
+The client cooperates rather than enforcing: `useBrowseJobs` stops paging at the
+cap. That is a correctness fix as much as a policy one — because the server
+_clamps_ rather than errors, asking for offset 520 returns the offset-500 page
+again, which would have appended duplicate rows to the list forever.
+
+### Search input is escaped, not interpolated
+
+Text search runs through `ilike`, and the pattern is built by escaping `\`, `%`
+and `_` in the user's input first. Without that, a search for `%` matches every
+row in the radius — a one-character way to defeat the filter and pull the
+maximum page every time. Verified: searching `%` and `_` each return **0** rows
+rather than everything. (Values are passed as RPC parameters throughout, so this
+is about wildcard semantics, not SQL injection.)
+
+### A real leak found and fixed: drafts in browse results
+
+`nearby_jobs` (0007) has no status filter — it relies entirely on RLS, and
+`jobs_select_own` lets a poster read their own unpublished drafts. Any screen
+built on it would have shown a poster their own drafts mixed in with live
+listings, indistinguishable from published work.
+
+Confirmed live by impersonating the poster who owns the seeded drafts:
+`nearby_jobs` returned **2 drafts**, `browse_jobs` returned **0**. Fixed by
+filtering `status = 'published'` explicitly in 0011 rather than inheriting
+visibility from RLS.
+
+The general lesson is worth keeping: **RLS answers "may this user read this
+row", which is not the same question as "does this row belong in this list".**
+Leaning on RLS for the second one will keep producing bugs like this.
+
+### Sign-out now clears the query cache
+
+Added to the new Home screen (carried over from the phase 3 audit). `signOut()`
+is followed by `queryClient.clear()`, because otherwise the next account to sign
+in on the same device would briefly render the previous account's profile and
+job list from cache before the refetch landed.
+
+### Outstanding
+
+- **`get_advisors` is STILL unavailable** — retried this phase, same privilege
+  error. Four phases of DDL have now never been linted, and 0011 added two more
+  functions. This is the longest-standing item in this file.
+- **No rate limiting anywhere.** See above; the caps are not a substitute.
+- **The map needs a Google Maps key before any Android build.** Not a
+  vulnerability, but it means the map is untested outside Expo Go. Documented in
+  `.env.example`.
+- **Location permission denial is a dead end.** If the user denies location,
+  browsing shows an explanation and a retry and nothing else — there is no
+  manual neighbourhood entry to fall back on. Acceptable for a prototype;
+  revisit when the FSA question is settled.
+- **The avatars bucket is public**, **a phantom storage row exists**, **test
+  accounts have known passwords**, and **the MCP PAT is in transcripts** — all
+  unchanged from earlier phases.
+
+---
+
+## 2026-09-19 — Phase 4 follow-up: the audit that `get_advisors` could not do
+
+### `get_advisors` is blocked by ACCOUNT role, not by token scope
+
+Four phases of this file have recorded "the PAT lacks scope". That was the wrong
+diagnosis. Calling the Management API directly with the configured token:
+
+```
+GET /v1/projects/{ref}                     -> HTTP 200   (full project detail)
+GET /v1/projects/{ref}/advisors/security   -> HTTP 403
+GET /v1/projects/{ref}/advisors/performance-> HTTP 403
+```
+
+The token authenticates and reads the project fine. Only the advisors endpoints
+refuse, and the message is _"Your **account** does not have the necessary
+privileges"_ — an account/organization role check, not a token scope check.
+
+**Widening or re-minting the PAT will therefore probably not fix it.** The
+account needs a higher role in organization `vkdjxnmgxfckctdlqrfn`, or the
+project needs to be on a plan where advisors are exposed. That is a dashboard
+action, not something that can be changed from here.
+
+Recording this because "the PAT lacks scope" has been carried forward
+unexamined for four phases and has been sending the fix in the wrong direction.
+
+### The audit ran anyway, as SQL
+
+The point of `get_advisors` was never the tool, it was the coverage. Supabase's
+security linter rules are reproducible against the catalog, so they were. Every
+result below is from the live project.
+
+**RLS coverage — clean.** All five public tables have RLS enabled, at least one
+policy, and a primary key.
+
+| Table    | RLS | Policies | PK  |
+| -------- | --- | -------- | --- |
+| jobs     | on  | 5        | yes |
+| messages | on  | 3        | yes |
+| offers   | on  | 6        | yes |
+| profiles | on  | 3        | yes |
+| reviews  | on  | 4        | yes |
+
+No table has policies while RLS is off, and none has RLS on with zero policies.
+
+**Function `search_path` — clean.** All 15 functions across `public` and `app`
+set `search_path=""`, including all 9 `SECURITY DEFINER` ones. A definer
+function with a mutable search_path is the classic privilege-escalation path in
+Postgres, and there are none.
+
+**Views and extensions — clean.** No views or materialized views in `public` at
+all, so there is no `SECURITY DEFINER` view and nothing exposing `auth.users`.
+No foreign tables. Every extension (postgis, pgcrypto, uuid-ossp,
+pg_stat_statements) lives in `extensions`, not `public`.
+
+### FINDING — `anon` holds blanket table privileges that RLS does not fully cover
+
+The one thing the audit turned up. Supabase's project defaults include
+`GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated`, and the
+migrations only ever revoked what they needed to (SELECT/INSERT/UPDATE on
+specific tables). What is left for `anon`:
+
+| Table    | `anon` still holds                                    | `anon` policies      |
+| -------- | ----------------------------------------------------- | -------------------- |
+| jobs     | DELETE, TRUNCATE, TRIGGER, REFERENCES                 | 1 (select published) |
+| messages | SELECT, INSERT, DELETE, TRUNCATE, TRIGGER, REFERENCES | 0                    |
+| offers   | SELECT, INSERT, DELETE, TRUNCATE, TRIGGER, REFERENCES | 0                    |
+| profiles | INSERT, DELETE, TRUNCATE, TRIGGER, REFERENCES         | 0                    |
+| reviews  | SELECT, INSERT, DELETE, TRUNCATE, TRIGGER, REFERENCES | 0                    |
+
+For SELECT, INSERT, UPDATE and DELETE this is survivable: RLS is enabled and
+`anon` has no policy granting any of them, so every such statement is denied.
+The grants are redundant, not exploitable.
+
+**TRUNCATE is the exception, and it is worth understanding why.** Row-level
+security filters _rows_; TRUNCATE does not operate on rows, and PostgreSQL does
+not apply RLS policies to it at all. So for TRUNCATE the grant is the _only_
+control, and `anon` has it on all five tables. RLS is not a backstop here.
+
+**How bad is it, honestly:** latent rather than live. PostgREST exposes no way
+to issue TRUNCATE, and the publishable key is a JWT for PostgREST rather than
+database credentials, so there is no known path from "holds the anon key" to
+"truncates a table". The exposure would become real the moment anything else
+can execute arbitrary SQL as `anon` — a direct connection, a misconfigured
+pooler, or a future `SECURITY INVOKER` function that takes SQL text.
+
+**Recommended fix**, not applied because it was outside what this change was
+asked to do:
+
+```sql
+revoke truncate, trigger, references, delete on all tables in schema public
+  from anon;
+-- and the same for `authenticated` on the tables it has no business deleting,
+-- checked case by case against the delete policies in 0003-0006.
+```
+
+This is a default that every Supabase project carries, not something these
+migrations introduced. It is still worth closing before phase 5 adds tables that
+inherit the same defaults.
+
+### `nearby_jobs` dropped (migration 0012)
+
+Retired rather than left dormant. It had no caller left — nothing in `/src`
+referenced it, and the only uses were three ground-truth queries in
+`seed_test_data.sql`, rewritten to hit `public.jobs` directly.
+
+The security reason for dropping rather than ignoring: it was a live,
+`EXECUTE`-granted endpoint reachable by anyone holding the publishable key,
+independent of whether the app called it. It had no status filter (so it
+returned a poster's own drafts, verified: 2 vs 0 from `browse_jobs`) and no
+pagination or caps (so it returned every job in the radius in one response).
+Leaving it live would have meant the anti-scrape caps added in 0011 could be
+sidestepped by calling the older function instead. Confirmed gone: `public` now
+exposes exactly `browse_jobs`, `nearby_job_categories` and `job_exact_location`.
+
+### Test fixtures must be purged before real signups
+
+Logged here as well as in TESTING.md because it is a data-exposure issue, not
+just a tidiness one. The database currently holds **56 published fixture jobs**,
+all owned by test accounts, all clustered on downtown Toronto, plus test
+profiles with known passwords created via raw SQL.
+
+If real users sign up against this project, they will browse a marketplace
+mostly made of fake listings attached to accounts nobody controls, and the
+fixture rows are indistinguishable from real ones in the UI. The known-password
+test accounts are the sharper end of it: they are real, signable-in accounts in
+the same auth table as real users.
+
+**Before any real signup — whether a beta tester, a store review build, or a
+demo — purge fixtures and test accounts.** The procedure is in TESTING.md under
+"Purging fixture data". This is a release blocker, not a nice-to-have.
+
+### Outstanding
+
+- **`get_advisors` still unavailable**, now correctly attributed to account role
+  rather than token scope. The SQL audit above is the interim substitute and
+  should be re-run when phase 5 adds schema.
+- **`anon` blanket grants**, above. Recommended fix written, not applied.
+- **Fixture data and known-password test accounts are still in the database.**
+  Release blocker.
+- **The MCP PAT is in this session's transcript** and in two config files on
+  this machine (`~/.claude.json` and `~/.claude/settings.json`). Rotate when
+  prototype work ends; if the account role is changed to unblock advisors, that
+  is a natural moment to re-mint it.
+- **No rate limiting.** Unchanged from the phase 4 entry; the caps are not a
+  substitute.
+- **The avatars bucket is public** and **a phantom storage row exists** —
+  unchanged.

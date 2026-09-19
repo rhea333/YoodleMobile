@@ -21,6 +21,7 @@ export {
   AVATAR_BUCKET,
   MAX_AVATAR_BYTES,
   getMyProfile,
+  getProfileById,
   isValidPostalCode,
   normalisePostalCode,
   updateMyProfile,
@@ -34,3 +35,15 @@ export type {
   PickedImage,
   ProfileResult,
 } from './profiles';
+export {
+  BROWSE_PAGE_SIZE,
+  DEFAULT_RADIUS_METERS,
+  MAX_BROWSE_OFFSET,
+  MAX_RADIUS_METERS,
+  browseJobs,
+  formatBudget,
+  formatDistance,
+  getJobById,
+  getNearbyJobCategories,
+} from './jobs';
+export type { BrowseJobsParams, BrowseJobsResult, JobCategoriesResult, JobResult } from './jobs';
