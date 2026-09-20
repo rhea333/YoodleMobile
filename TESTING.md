@@ -1489,3 +1489,248 @@ It should appear once, and removing it should remove it cleanly.
 - **Over-long titles are silently truncated** at 140 characters rather than
   flagged, because sanitising runs before validation — so the over-length branch
   in `validateJobForm` is unreachable.
+
+---
+
+## 2026-09-19 — Phase 6: offers, chat and notifications
+
+### Verified automatically
+
+- `npx tsc --noEmit`, `npx eslint .`, `npx prettier --check .` — all exit 0.
+- `npx expo export --platform ios` — 1424 modules.
+
+### The realtime RLS test — an actual automated test, at last
+
+`supabase/tests/realtime_rls_test.mjs`. Run it from the project root:
+
+```sh
+node supabase/tests/realtime_rls_test.mjs
+```
+
+It signs in three real accounts, creates a probe job, has two of them bid,
+subscribes all three to the **whole** `messages` and `offers` tables with no
+filter, then runs a private conversation past them. 13 assertions, all passing.
+It cleans up its probe job afterwards (offers and messages cascade), so it is
+safe to re-run.
+
+**It found a real bug**, which is the point of writing it rather than reasoning:
+`makeOffer` used a PostgREST upsert, which fails with _"permission denied for
+table offers"_ even on a first bid, because an upsert needs UPDATE on `job_id`
+and `worker_id` and migration 0004 revokes exactly those. Details in
+SECURITY.md.
+
+**It also had a bug of its own, worth knowing about if you extend it.** The
+first version inserted the offers BEFORE subscribing, and the offer assertions
+passed anyway — replication lag delivered them a moment late, so the test was
+measuring timing, not authorisation. It now writes every asserted row after all
+three subscriptions report `SUBSCRIBED`. If you add a case, keep it after that
+barrier; a green test that passes by race is worse than no test.
+
+### Test accounts for this phase
+
+Created directly in `auth` because the signup email rate limit blocks the normal
+path. All three are confirmed and can sign in:
+
+| Email                     | Password           | Role in the tests                    |
+| ------------------------- | ------------------ | ------------------------------------ |
+| `p6-poster@yoodle.test`   | `Phase6Test!pass1` | posts the job, accepts/declines      |
+| `p6-worker@yoodle.test`   | `Phase6Test!pass2` | bids and chats                       |
+| `p6-outsider@yoodle.test` | `Phase6Test!pass3` | the third party who must see nothing |
+
+These are now part of the purge procedure. Nothing with a known password should
+survive into a build real people use.
+
+### Manual testing — please run these
+
+You need **two devices, or one device and one simulator**, signed in as the
+poster and the worker. Expo Go on a phone plus a second Expo Go session works.
+
+**1. Make an offer.** As the worker, open a job the poster owns → **Apply** →
+enter an amount and an optional note → send.
+
+- On your own job, the button should instead read **This is your job** and be
+  disabled. That is not cosmetic: `offers_insert_own` refuses a bid on your own
+  job, so the button would fail rather than do nothing.
+- Try amount `0` — expect an inline error, not an alert.
+- Send a second offer on the same job with a different amount. It should
+  **amend** the existing offer rather than create a second one. Check:
+
+```sql
+select job_id, worker_id, amount, status from public.offers order by created_at desc limit 5;
+```
+
+One row per worker per job, with the new amount and `status = 'pending'`.
+
+**2. Real-time messages, both directions — the headline test.** Put poster and
+worker on the **Chat** screen for the same job, side by side.
+
+- Send from the worker. It should appear on the poster's screen **without any
+  refresh, pull-to-refresh, or navigation**. A second or two is realtime; ten
+  seconds means something fell back to a refetch.
+- Send from the poster. Same, in reverse.
+- Background one device, send from the other, then foreground it. The message
+  should be there — the thread refetches on mount, so realtime gaps heal.
+- Watch the sender's own screen: their message should appear immediately on
+  send, and must **not** appear twice when the realtime echo arrives.
+
+**3. A third account cannot read the conversation.** The automated test proves
+this at the SDK level; this is the version you can do by hand.
+
+Sign in as `p6-outsider@yoodle.test` on a third session, bid on the same job so
+they are a genuine party to it, then:
+
+```sql
+-- Confirm the messages exist at all.
+select id, body from public.messages where job_id = '<the job id>';
+```
+
+The outsider's app must show **no trace** of the poster/worker conversation —
+not in Notifications, not anywhere. To check it at the API level rather than the
+UI level, run the automated test, which asserts exactly this with an unfiltered
+subscription.
+
+**4. Accept and decline.** As the poster, go to **Offers**.
+
+- The worker's offer appears under _Offers on your jobs_.
+- Tap **Accept**. The badge becomes **Accepted**.
+- On the worker's device, their _Your offers_ entry should flip to **Accepted**,
+  and a notification should arrive. If the worker's screen is open, the
+  invalidation should update it without a manual refresh.
+- Repeat with **Decline** on a second offer, and confirm the row still exists:
+
+```sql
+select id, amount, status from public.offers where job_id = '<the job id>';
+```
+
+Nothing should be deleted — declined offers stay so the worker can see what
+happened.
+
+- **Accepting takes no money.** Confirm nothing in the UI implies otherwise. If
+  any copy reads like a payment was made, that is a bug worth fixing before
+  payments land and make it ambiguous.
+
+**5. Notification badge.** With the worker's app open on Home, send a message
+from the poster.
+
+- A count should appear next to **Alerts** without navigating.
+- Open **Alerts** → the item is listed, and the badge clears.
+- Force-quit and reopen: the list should be **empty**. That is by design — the
+  feed is in memory only, so "since last opened" means since this launch.
+- Sign out and back in as a different account: no notifications from the
+  previous account should survive.
+
+### Known gaps
+
+- **Notifications do not survive a quit**, and there are no push notifications.
+  Both are deliberate for this phase.
+- **No block or report.** See SECURITY.md — logged as a launch blocker.
+- **The worker's side of "Offers" is a list, not an inbox.** There is no
+  conversation list; you reach a chat through an offer.
+- **No typing indicators, read receipts or delivery state.** A message either
+  appears or it does not.
+- **The automated test needs the three `p6-*` accounts.** It fails at sign-in if
+  they have been purged; recreate them with the SQL in this section's history or
+  adapt it to your own accounts.
+- **Still nothing run on a device by me.** The realtime test exercises the same
+  client library the app uses, but not the app.
+- **Fixture data and known-password accounts still present.** Release blocker.
+
+---
+
+## 2026-09-19 — Phase 6 review fixes: a second automated suite
+
+Nine defects from the phase 6 review are fixed. The security reasoning is in
+SECURITY.md; this covers the tests and what to re-check by hand.
+
+### New: `offer_mutation_rules_test.mjs`
+
+```sh
+node supabase/tests/offer_mutation_rules_test.mjs
+```
+
+13 assertions against the live database as two real users, guarding migration 0016. It exists because three real holes were found — a worker re-pricing an
+accepted offer, a poster rewriting the worker's note, and a poster changing the
+worker's price — and because **payments will read `offers.amount` as the number
+to charge.** If this suite fails, that number is not trustworthy.
+
+What it asserts:
+
+|                                                     |     |
+| --------------------------------------------------- | --- |
+| worker CAN amend a pending offer                    | ✓   |
+| worker CANNOT re-price an accepted offer            | ✓   |
+| worker CANNOT reopen an accepted offer              | ✓   |
+| worker CANNOT accept or decline their own offer     | ✓   |
+| worker CAN withdraw a pending offer                 | ✓   |
+| worker CANNOT amend a withdrawn offer               | ✓   |
+| poster CANNOT change the worker's price             | ✓   |
+| poster CANNOT change the worker's note              | ✓   |
+| poster CANNOT smuggle a price change into an accept | ✓   |
+| poster CAN accept, with amount and note untouched   | ✓   |
+| poster CANNOT decline an already-accepted offer     | ✓   |
+
+It creates and deletes its own jobs, so it is safe to re-run.
+
+### The realtime suite was flaky, and is not any more
+
+`realtime_rls_test.mjs` failed once out of several runs — on timing, not on
+authorisation. It used fixed 3-second sleeps, which are usually enough for a
+Realtime round trip and occasionally are not.
+
+**A security test that fails at random is one people learn to ignore**, so it
+now polls for a condition with a deadline instead. It waits for the events that
+are _supposed_ to arrive, then asserts the outsider received nothing — by which
+point the outsider has had at least as long to receive anything they were going
+to. Three consecutive clean runs after the change.
+
+### Watch the posting rate limit when running these
+
+Between them the two suites create four jobs per full cycle, all as
+`p6-poster@yoodle.test`, and migration 0014 caps a poster at **10 jobs per
+rolling hour**. Run both suites three times in quick succession and the next run
+fails at job creation with _"Too many jobs posted in the last hour."_
+
+That is the rate limit working, not a broken test. Wait, or use a different
+poster account.
+
+### Re-test by hand
+
+**A. Amending an offer.** As the worker, offer on a job, then Apply again with a
+different amount — it should amend. Then have the poster **accept**, and try to
+amend again. Expect: _"You already have an offer on this job and it can no
+longer be changed — it has been accepted, declined or withdrawn."_ Before this
+fix the amend silently succeeded and reset the offer to pending.
+
+**B. The poster is told when a bid changes.** Poster on the Offers screen,
+worker amends their price from another device. The poster's list should update
+and a notification should arrive, without a manual refresh. Previously the
+poster saw the old amount indefinitely.
+
+**C. No self-notifications.** Withdraw your own offer. You should get **no**
+notification about it — only the poster should. Likewise, a poster accepting an
+offer should not notify themselves.
+
+**D. Repeated transitions each notify.** Have the poster decline an offer, the
+worker re-bid, and the poster decline again. **Two** decline notifications
+should appear. Previously the second was swallowed, because the notification id
+was keyed on offer id plus status rather than on the write.
+
+**E. The badge clears and stays cleared.** Open Alerts (badge clears) → tap into
+a Chat → go back. With a message arriving in between, the badge should clear
+again on return. Previously it stuck, because the screen stays mounted under a
+pushed Chat and the mark-seen only ran on mount.
+
+**F. Offer context failure is visible.** Hard to stage deliberately; the
+behaviour to know is that a failed job/profile lookup on the Offers screen now
+shows an error instead of silently rendering "A job" / "A neighbour" and hiding
+the Message button.
+
+### Known gaps carried forward
+
+- Chat headers still read "The poster" / "Your neighbour"; only worker profiles
+  are loaded into the offer context.
+- `MakeOfferScreen` swallows a submit with no feedback in the brief window
+  before the session resolves.
+- Both automated suites need the three `p6-*` accounts, and both are covered by
+  the purge procedure — which will break them. That is the right trade: nothing
+  with a known password should survive into a build real people use.

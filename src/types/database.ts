@@ -124,7 +124,15 @@ export type OfferRow = {
   worker_id: Uuid;
   amount: number;
   status: OfferStatus;
+  /** Optional note the worker sent with the bid. Sanitised; capped at 1000. */
+  message: string | null;
   created_at: Timestamptz;
+  /**
+   * Set by trigger on every write (0016). Client-unwritable, and used to give
+   * each status transition its own identity — without it, declined -> re-bid ->
+   * declined collapses into one notification.
+   */
+  updated_at: Timestamptz;
 };
 
 export type OfferInsert = {
@@ -132,11 +140,13 @@ export type OfferInsert = {
   worker_id: Uuid;
   amount: number;
   status?: OfferStatus;
+  message?: string | null;
 };
 
 export type OfferUpdate = {
   amount?: number;
   status?: OfferStatus;
+  message?: string | null;
 };
 
 export type MessageRow = {

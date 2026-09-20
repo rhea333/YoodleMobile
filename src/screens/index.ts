@@ -1,9 +1,13 @@
+export { ChatScreen } from './ChatScreen';
 export { CompleteProfileScreen } from './CompleteProfileScreen';
 export { DesignSystemScreen } from './DesignSystemScreen';
 export { EditJobScreen } from './EditJobScreen';
 export { HomeScreen } from './HomeScreen';
 export { JobDetailScreen } from './JobDetailScreen';
+export { MakeOfferScreen } from './MakeOfferScreen';
 export { MyJobsScreen } from './MyJobsScreen';
+export { NotificationsScreen } from './NotificationsScreen';
+export { OffersScreen } from './OffersScreen';
 export { PostJobScreen } from './PostJobScreen';
 export { LogInScreen } from './LogInScreen';
 export { SignUpScreen } from './SignUpScreen';

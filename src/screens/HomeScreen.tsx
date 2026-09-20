@@ -5,7 +5,7 @@ import { ActivityIndicator, FlatList, RefreshControl, ScrollView, Text, View } f
 import MapView, { Marker } from 'react-native-maps';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { Button, Chip, JobCard, TextInput } from '../components';
+import { Badge, Button, Chip, JobCard, TextInput } from '../components';
 import {
   useBrowseJobs,
   useBrowseLocation,
@@ -15,6 +15,7 @@ import {
 } from '../hooks';
 import type { MainStackParamList } from '../navigation/types';
 import { DEFAULT_RADIUS_METERS, signOut } from '../services';
+import { selectUnreadCount, useNotificationsStore } from '../state/notifications';
 import { spacing } from '../theme';
 import type { BrowseJobRow } from '../types/database';
 
@@ -69,6 +70,9 @@ export const HomeScreen = ({ navigation }: Props) => {
   const { colors } = useTheme();
   const queryClient = useQueryClient();
 
+  const unreadCount = useNotificationsStore(selectUnreadCount);
+  const clearNotifications = useNotificationsStore((state) => state.clear);
+
   const [viewMode, setViewMode] = useState<ViewMode>('list');
   const [category, setCategory] = useState<string | null>(null);
   const [searchInput, setSearchInput] = useState('');
@@ -96,6 +100,9 @@ export const HomeScreen = ({ navigation }: Props) => {
     // to sign in on this device would briefly see the previous one's profile
     // and job list from cache before the refetch lands.
     queryClient.clear();
+    // Same reasoning, and it matters more here: the notification feed holds
+    // message previews. They must not survive into another account's session.
+    clearNotifications();
   };
 
   const clearFilters = () => {
@@ -127,6 +134,22 @@ export const HomeScreen = ({ navigation }: Props) => {
               variant="ghost"
             />
           ) : null}
+          <View>
+            <Button
+              accessibilityLabel={
+                unreadCount > 0 ? `Notifications, ${unreadCount} new` : 'Notifications'
+              }
+              label="Alerts"
+              onPress={() => navigation.navigate('Notifications')}
+              size="sm"
+              variant="ghost"
+            />
+            {unreadCount > 0 ? (
+              <View className="absolute -right-xs -top-xs" pointerEvents="none">
+                <Badge label={unreadCount > 9 ? '9+' : String(unreadCount)} tone="accent" />
+              </View>
+            ) : null}
+          </View>
           <Button
             accessibilityLabel="Sign out"
             label="Sign out"
@@ -175,6 +198,12 @@ export const HomeScreen = ({ navigation }: Props) => {
         {/* Entry points to the phase 5 posting flow. The browse behaviour below
             is untouched. */}
         <View className="flex-row items-center gap-xs">
+          <Button
+            label="Offers"
+            onPress={() => navigation.navigate('Offers')}
+            size="sm"
+            variant="ghost"
+          />
           <Button
             label="My jobs"
             onPress={() => navigation.navigate('MyJobs')}

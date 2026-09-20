@@ -1310,3 +1310,269 @@ Not security-relevant, recorded so the diff is explicable:
   `sanitizeJobTitle` truncates first. Over-long titles are silently truncated
   rather than flagged. Harmless, but the dead branch is misleading and should
   either validate before sanitising or be removed.
+
+---
+
+## 2026-09-19 — Phase 6: offers, live messaging, and what Realtime does with RLS
+
+The first phase where two strangers talk to each other in private. The central
+question was whether Realtime enforces the same rules as a query, and it was
+answered by measurement rather than by reading.
+
+### Realtime and RLS — tested with three accounts, not asserted
+
+Three real accounts were created, signed in through the client SDK, and pointed
+at one private conversation. The third account subscribed to the **entire
+`messages` table with no filter** — the strongest form of the question, not a
+polite one — and was also given a legitimate reason to be there: they had placed
+their own offer on the same job, so they are a party to the job, just not to the
+conversation.
+
+Results, all from `supabase/tests/realtime_rls_test.mjs`:
+
+| Check                                        | Result           |
+| -------------------------------------------- | ---------------- |
+| Poster receives both messages over Realtime  | 2 of 2           |
+| Worker receives both messages over Realtime  | 2 of 2           |
+| **Outsider receives messages over Realtime** | **0**            |
+| Outsider `SELECT` on the conversation        | 0 rows           |
+| Outsider tries to insert into the thread     | refused by RLS   |
+| Poster sees both offers on their own job     | `[30, 99]`       |
+| Worker sees rival's bid                      | no — only `[30]` |
+| Outsider sees rival's bid                    | no — only `[99]` |
+
+So: **Realtime applies the same policies as a query, for INSERT and UPDATE.**
+An unfiltered subscription is not a way around `messages_select_own_thread`, and
+it is not a way around `offers_select_own` either — competing bids stay hidden
+live, exactly as they are on a read.
+
+This also settles a detail the Supabase docs raise: they say to call `setAuth()`
+with the user's token before subscribing. supabase-js v2 does that itself when
+the session changes — if it did not, the two participants would have received
+nothing either, and they received everything.
+
+### DELETE is the exception, and it is handled in two places
+
+The docs are explicit: _"RLS policies are not applied to DELETE statements,
+because there is no way for Postgres to verify that a user has access to a
+deleted record."_ `messages_delete_own` lets any sender retract a message, so
+this is a reachable path, not a hypothetical.
+
+Two independent decisions keep it harmless:
+
+1. **`messages` is left at the DEFAULT replica identity** (migration 0015 says
+   so in a comment, at length, because the temptation to "fix" it is real).
+   Logical replication then sends only the primary key for a DELETE, so the
+   payload that escapes RLS is a bare `id`. **Setting `REPLICA IDENTITY FULL`
+   would put the whole row — including `body` — into that unfiltered payload**,
+   broadcasting private message text to every subscriber on the table. Several
+   Realtime guides recommend `FULL` casually, for the unrelated reason that it
+   enables filtering on DELETE. Do not follow that advice here.
+2. **Nothing subscribes to DELETE.** `subscribeToThread` and `subscribeToInbox`
+   register INSERT and UPDATE handlers only.
+
+Either alone would be sufficient. Both together mean a future change has to undo
+two separate decisions, in two files, to create a leak.
+
+### Message text is sanitised on the same path as job descriptions
+
+`sanitizeMessageBody` is the phase 5 sanitiser with a 4000-character ceiling,
+applied in `sendMessage` before the insert — so it runs for any caller, not just
+the chat screen. Control characters, zero-width characters and bidi overrides
+are stripped; HTML is deliberately left alone, for the reasons in the phase 5
+entry.
+
+Bidi overrides matter more here than in a listing. A message is the record of
+what two people agreed before meeting in person, and U+202E lets a message
+render one way on the recipient's screen and store another way in the database.
+That is a useful property if you intend to dispute what you said. Offer notes go
+through the same treatment with a 1000-character ceiling (`offers.message`,
+constrained in 0015).
+
+### A privilege restriction caught an implementation that would have undermined it
+
+Worth recording because the control worked exactly as intended, against me.
+
+`makeOffer` was first written as a PostgREST `upsert`, which reads naturally
+given `offers_one_per_worker_per_job`. It failed with _"permission denied for
+table offers"_ — on a first bid, where nothing conflicts.
+
+The cause: an upsert compiles to `INSERT ... ON CONFLICT DO UPDATE SET` over
+every column sent, including `job_id` and `worker_id`. Migration 0004 revokes
+UPDATE on exactly those two columns, with the comment _"Neither party may move
+an offer to a different job or a different worker."_ Postgres checks column
+privileges for the `DO UPDATE` clause statically, whether or not a conflict
+occurs — so the statement is refused every time.
+
+Rewritten as insert-then-update-on-23505, where the amend path writes only
+`amount`, `message` and `status`. The restriction stands, and the column-level
+grant was what surfaced the problem rather than letting a convenient-looking
+statement quietly widen what a worker can change.
+
+### OPEN ITEM — block and report, before launch
+
+Logging this as the spec asked, with a recommendation rather than a shrug.
+
+**Yoodle introduces strangers and then sends one of them to the other's home.**
+That is a materially different risk profile from a marketplace that ships
+parcels. As of this phase a user can be messaged by anyone who bids on their
+job, or who posts a job they bid on, and there is:
+
+- no way to block a user;
+- no way to report a message, an offer, a listing or a person;
+- no record that would support a report — messages cannot be edited, which is
+  good, but nothing is retained on the moderation side because there is no
+  moderation side;
+- no way to stop a blocked person simply bidding again, since `offers` has no
+  notion of a blocked pair.
+
+**Recommendation: this is a launch blocker, not a nice-to-have.** The minimum
+that seems defensible before real users:
+
+1. A `blocks` table (blocker, blocked), enforced in the `messages` and `offers`
+   insert policies so a block actually prevents contact rather than only hiding
+   it client-side.
+2. A `reports` table capturing reporter, subject, reason and a snapshot of the
+   reported content, since a reported message can be deleted by its sender.
+3. Somewhere for reports to go. A table nobody reads is not moderation.
+
+Sizing and scheduling that is your call; recording that it is unbuilt is mine.
+
+### Test accounts added for this phase
+
+Three accounts were created directly in `auth` (the signup email rate limit
+blocks the normal path), with password hashes and identity rows so they can sign
+in: `p6-poster@yoodle.test`, `p6-worker@yoodle.test`, `p6-outsider@yoodle.test`.
+They have known passwords, they are listed in TESTING.md, and they are covered
+by the existing purge procedure — which is now more pressing, not less.
+
+### Outstanding
+
+- **Block and report do not exist.** See above. Launch blocker.
+- **Notifications are in-memory only** and cleared on sign-out and on quit. That
+  is deliberate — message previews would otherwise be written to unencrypted
+  storage — but it means "since last opened" is literally since this launch.
+- **`get_advisors` still unavailable**; two more tables are now in the Realtime
+  publication and neither has been linted.
+- **`authenticated` still holds TRUNCATE** and the other Supabase defaults.
+- **Fixture data and test accounts still present.** Release blocker, now three
+  accounts larger.
+- **Photo orphans on job cancellation** remain from phase 5.
+
+---
+
+## 2026-09-19 — Phase 6 review: an offer's amount was not trustworthy
+
+A review of the phase 6 diff turned up ten defects. Three of them let one party
+rewrite the other's side of a deal. All three are fixed in migration 0016 and
+guarded by a permanent test.
+
+This entry matters more than most because **payments reads `offers.amount` as
+the number to charge.** Until now that number could be changed after agreement,
+by either side.
+
+### The three holes, demonstrated rather than argued
+
+Each was reproduced against the live database, signed in through the normal
+client SDK as ordinary users — no admin key, nothing exotic.
+
+**1. A worker could re-price an already-accepted offer.** `offers_update_own`
+checks only `worker_id = auth.uid()`; it never looks at status. And accepting an
+offer does not change the job's status — the job stays `published` — so the
+Apply button remained live and the path was reachable straight from the UI.
+
+```
+after accept:  {"amount":40,"status":"accepted"}
+CONFIRMED:     worker re-priced it -> {"amount":999,"status":"pending"}
+```
+
+**2. A poster could rewrite the worker's offer note.** `"original worker note"`
+became `"POSTER REWROTE THIS"`. Dispute-relevant text that the rest of the
+design treats as immutable — messages deliberately have no UPDATE path at all,
+for exactly this reason.
+
+**3. A poster could change the worker's price.** `$40` became `$1`. This one was
+NOT found by the review; it turned up while verifying (2), by asking whether the
+same reasoning extended to the neighbouring column. It does, and it is worse:
+combined with accept, a poster could have "accepted" a price the worker never
+offered.
+
+**This third one PREDATES PHASE 6.** `grant update (amount, status)` in
+migration 0004 has always been role-wide, so `offers_update_as_poster` has
+always carried the amount with it. Phase 6 did not introduce it; phase 6 built
+the screens that made it reachable. Recording that plainly because the fix ships
+in a phase 6 commit and the blame does not belong there.
+
+### Why neither RLS nor grants could have caught this
+
+Worth stating, because the instinct is to reach for a policy:
+
+- **RLS decides which ROWS** a statement may touch. Both parties legitimately
+  have an UPDATE policy on the same row.
+- **Column grants decide which COLUMNS a ROLE may write.** Poster and worker are
+  both `authenticated`. A grant cannot distinguish them.
+
+The rule that was needed — _this party may write this column on this row_ — sits
+in the gap between the two. A `BEFORE UPDATE` trigger is the only place in
+Postgres that can see the actor, the old row and the new row at once.
+
+### What migration 0016 enforces
+
+| Party                | May change                                                   | May NOT                                                        |
+| -------------------- | ------------------------------------------------------------ | -------------------------------------------------------------- |
+| Worker (offer owner) | `amount`, `message` while `pending`; withdraw from `pending` | accept, decline, reopen a settled offer, amend a settled offer |
+| Poster (job owner)   | `status`: `pending` → `accepted` or `declined`               | `amount`, `message`, ever; re-decide a settled offer           |
+| Anyone else          | —                                                            | everything (RLS already refuses; the trigger is a backstop)    |
+
+Callers with no JWT (`auth.uid() is null` — migrations, seeds, service role) pass
+through, as they already do for RLS.
+
+Also added: `offers.updated_at`, set by trigger and not granted for UPDATE. It
+gives each status transition a distinct identity, which fixes a notification bug
+where declined → re-bid → declined collapsed into one entry.
+
+### Permanent regression test
+
+`supabase/tests/offer_mutation_rules_test.mjs` — 13 assertions, run against the
+live database as two real users. It covers the three holes above plus the
+adjacent cases: a worker cannot accept their own offer, cannot amend a withdrawn
+one, and a poster cannot **smuggle a price change into an accept** by sending
+both columns in one statement.
+
+The file says in its header that if any assertion fails, `offers.amount` is not
+trustworthy and payments must not ship. That is the point of it existing rather
+than the finding simply being verified once and written up.
+
+### Also fixed, non-security
+
+- **Migration 0015 was not idempotent.** `alter publication ... add table`
+  raises 42710 on a second run, and enabling Realtime from the Supabase
+  dashboard adds the table to the same publication — so on a project where that
+  toggle had been clicked, the whole migration would abort and `offers.message`
+  would never land while the client wrote it on every offer. Now guarded. Same
+  class of reproducibility failure as the phase 3 lost migration.
+- **The poster was never told when a worker amended a bid**, and their offer
+  queries were never invalidated, so a stale amount could sit on screen
+  indefinitely. The inbox subscription now forwards every offer UPDATE that RLS
+  delivers, and the hook decides who to tell.
+- **Users were notified about their own actions** ("Your offer was withdrawn",
+  to the person who withdrew it). Suppressed by reading the direction of the
+  transition, which 0016 makes unambiguous: only a poster can accept or decline,
+  only a worker can move an offer to pending or withdrawn.
+- **`loadOfferContext` ignored its errors**, rendering every job as "A job" and
+  silently removing the worker's only Message button with nothing on screen to
+  explain it.
+- **The notification badge could stick**, because `markAllSeen` ran on mount and
+  React Navigation keeps the screen mounted under a pushed Chat. Now on focus.
+
+### Deferred
+
+- Chat headers still read "The poster" / "Your neighbour" — only `worker_id`s
+  are loaded into the profile context, so the poster's name is never fetched.
+- `MakeOfferScreen` swallows a submit with no feedback in the brief window
+  before `useSession` resolves.
+
+### Unchanged and still outstanding
+
+Block and report remain unbuilt, and remain the launch blocker described in the
+phase 6 entry. Nothing here touches that.

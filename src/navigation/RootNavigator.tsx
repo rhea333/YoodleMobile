@@ -6,7 +6,7 @@ import {
 import { StatusBar } from 'expo-status-bar';
 import { ActivityIndicator, View } from 'react-native';
 
-import { useProfileQuery, useSession, useTheme } from '../hooks';
+import { useProfileQuery, useRealtimeInbox, useSession, useTheme } from '../hooks';
 import { fontWeights, typography } from '../theme';
 import { AuthNavigator } from './AuthNavigator';
 import { MainNavigator } from './MainNavigator';
@@ -45,6 +45,10 @@ export const RootNavigator = () => {
   // Drives whether onboarding is shown first. Only meaningful once signed in;
   // the hook is disabled while userId is undefined.
   const profileQuery = useProfileQuery(userId);
+
+  // Mounted here rather than on a screen so the notification badge keeps
+  // filling while the user is anywhere in the app. No-ops without a session.
+  useRealtimeInbox(userId);
 
   const screenOptions = {
     headerStyle: { backgroundColor: colors.surface },

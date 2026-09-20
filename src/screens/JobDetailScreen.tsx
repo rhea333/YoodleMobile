@@ -3,7 +3,7 @@ import { ActivityIndicator, Image, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Avatar, Badge, Button, Card } from '../components';
-import { usePosterQuery, useJobQuery, useTheme } from '../hooks';
+import { usePosterQuery, useJobQuery, useSession, useTheme } from '../hooks';
 import type { MainStackParamList } from '../navigation/types';
 import { formatBudget, jobPhotoUrl } from '../services';
 import { spacing } from '../theme';
@@ -22,10 +22,11 @@ type Props = NativeStackScreenProps<MainStackParamList, 'JobDetail'>;
  * "Apply" is an inert placeholder. It is rendered disabled rather than omitted
  * so the layout is the real one when the offers phase wires it up.
  */
-export const JobDetailScreen = ({ route }: Props) => {
+export const JobDetailScreen = ({ navigation, route }: Props) => {
   const { jobId } = route.params;
   const insets = useSafeAreaInsets();
   const { colors } = useTheme();
+  const { session } = useSession();
 
   const jobQuery = useJobQuery(jobId);
   const posterQuery = usePosterQuery(jobQuery.data?.poster_id);
@@ -52,6 +53,7 @@ export const JobDetailScreen = ({ route }: Props) => {
   const job = jobQuery.data;
   const budget = formatBudget(job.budget);
   const poster = posterQuery.data;
+  const isOwnJob = job.poster_id === session?.user.id;
 
   return (
     <ScrollView
@@ -131,9 +133,24 @@ export const JobDetailScreen = ({ route }: Props) => {
       </View>
 
       <View className="mt-xl">
-        <Button disabled fullWidth label="Apply (coming soon)" size="lg" />
+        {/*
+          You cannot offer on your own job — `offers_insert_own` refuses it, so
+          the button would fail rather than do nothing useful. Disabling it and
+          saying why is better than letting the policy produce the error.
+        */}
+        <Button
+          disabled={isOwnJob || job.status !== 'published'}
+          fullWidth
+          label={isOwnJob ? 'This is your job' : 'Apply'}
+          onPress={() => navigation.navigate('MakeOffer', { jobId })}
+          size="lg"
+        />
         <Text className="mt-sm text-center text-caption text-text-muted">
-          Applying opens up in the next release.
+          {isOwnJob
+            ? 'Offers from neighbours appear on your Offers screen.'
+            : job.status !== 'published'
+              ? 'This job is no longer open to offers.'
+              : 'Sending an offer does not charge anyone.'}
         </Text>
       </View>
     </ScrollView>
