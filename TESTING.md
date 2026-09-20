@@ -1269,3 +1269,223 @@ order by t.table_name;
 Every column should read `false`. Any `true` means a table was created by a
 role whose default privileges still grant `anon` — see the limitation noted in
 SECURITY.md.
+
+---
+
+## 2026-09-19 — Phase 5: posting, editing and cancelling
+
+### Verified automatically
+
+- `npx tsc --noEmit`, `npx eslint .`, `npx prettier --check .` — all exit 0.
+- `npx expo export --platform ios` — 1411 modules, so `expo-image-manipulator`
+  resolves in the bundle.
+- **13 assertions against the real sanitiser.** `src/services/sanitize.ts` was
+  compiled and executed, not eyeballed: bidi override stripping, zero-width
+  stripping, C0 controls, newlines kept in descriptions and collapsed in titles,
+  blank-line collapsing, space collapsing, trimming, NFC normalisation,
+  truncation at 140, an all-invisible title collapsing to empty, and HTML
+  surviving untouched. All pass.
+
+### Verified against the live database
+
+Each of these ran inside a transaction and was rolled back, so none of it is
+still in the data.
+
+- **Rate limit.** 10 jobs inserted for one poster succeed; the 11th within the
+  hour is rejected by `app.enforce_job_post_rate_limit`.
+- **Photo path ownership.** A `photo_paths` entry under another user's uid is
+  rejected; the poster's own is accepted.
+- **Photo count.** A fourth photo is rejected by `jobs_photo_paths_max`.
+- **Description ceiling.** 4001 characters is rejected by
+  `jobs_description_length`.
+- **Cancel semantics — the phase's headline test.** A published job in browse
+  results, set to `cancelled`, disappears from `browse_jobs` while the row
+  remains with `status = 'cancelled'`. Nothing is deleted.
+
+### Heads-up: the seed script and the new rate limit
+
+`supabase/tests/seed_browse_jobs.sql` inserts 54 rows for one poster, which the
+10-per-hour trigger would now block. The script disables `jobs_rate_limit` for
+its own transaction and re-enables it before commit. If you ever interrupt that
+script mid-run, **check the trigger is back on**:
+
+```sql
+select tgname, tgenabled from pg_trigger t join pg_class c on c.oid = t.tgrelid
+where c.relname = 'jobs' and t.tgname = 'jobs_rate_limit';
+```
+
+`tgenabled` should be `O`. If it is `D`, re-enable it:
+`alter table public.jobs enable trigger jobs_rate_limit;`
+
+### Manual testing — please run these
+
+**1. Inline validation, the spec's case.** Post a job → tap **Continue** with
+everything blank.
+
+- Expect inline errors under **Title** and **Category**. No alert, no crash, and
+  the step does not advance.
+- Fill the title, continue, then enter **0** as the budget → expect _"Please
+  enter an amount greater than zero."_ under the field. Try `-5` and an empty
+  budget too; all three should be caught inline.
+- Now the case worth checking specifically: put a valid title in, advance to
+  step 2, go **Back**, clear the title, then go forward and submit from step 3.
+  You should be **returned to step 1** with the title error showing — the final
+  submit validates the whole form, not just the visible step.
+
+**2. Post a job end to end.** Complete all three steps with a real title,
+category, budget, and the pin dragged somewhere recognisable. Add 1–3 photos.
+
+- On submit you should land on the new job's **detail screen**, with your
+  photos, title, budget and category.
+- Confirm the row:
+
+```sql
+select id, title, category, budget, status, coarse_lat, coarse_long, photo_paths, created_at
+from public.jobs order by created_at desc limit 1;
+```
+
+Expect `status = 'published'`, `photo_paths` holding 1–3 paths each starting
+with your user id, and `coarse_lat`/`coarse_long` rounded to 2 decimal places —
+**not** the exact spot you dropped the pin.
+
+**3. It appears in Browse (P04) and My Jobs.** Go back to Home and pull to
+refresh. The new job should be in the list, provided it is inside the 10 km
+radius of where your phone is. Then open **My jobs** — it should be there with
+an **Open** badge.
+
+**4. Cancel it.** In My Jobs, tap **Cancel** → an inline confirmation appears on
+that row (not an alert). Confirm.
+
+- The badge becomes **Cancelled** and Edit/Cancel disappear for that row.
+- Go to Home, pull to refresh: **the job is gone from Browse.**
+- The row is still there:
+
+```sql
+select id, title, status from public.jobs where title = '<your title>';
+```
+
+Expect exactly one row, `status = 'cancelled'`. If it returns nothing, the job
+was deleted and that is a bug.
+
+**5. EXIF — the important one, and the only way to confirm the fix.**
+
+Take a photo **outdoors with location services on** so the camera writes GPS
+into it, then post a job using it. Find the stored path from step 2, download
+it, and look for metadata:
+
+```sh
+curl -s -o photo.jpg "<the public URL from Storage → job-photos>"
+# Any one of these:
+exiftool photo.jpg                 # expect no GPS tags, minimal output
+python -c "from PIL import Image; print(Image.open('photo.jpg')._getexif())"   # expect None
+grep -c Exif photo.jpg             # expect 0
+```
+
+**Expect no GPS tags.** If GPS coordinates are present, the re-encode is not
+stripping them and SECURITY.md's claim is still wrong — tell me and stop using
+job photos until it is fixed.
+
+Worth repeating the same check on an **avatar** uploaded today, since that path
+was corrected in this phase too.
+
+**6. Sanitised text survives a round trip.** In a description, paste something
+with awkward characters — emoji, accented characters typed as combining marks,
+and a few blank lines. Save, reopen the detail screen.
+
+- Text should read the same, with runs of blank lines collapsed.
+- Typing `<b>bold</b>` should display **literally as typed**, not as bold and
+  not as `&lt;b&gt;`. That is deliberate; see SECURITY.md.
+
+**7. Edit.** My Jobs → Edit. Change the title and budget, save. The detail
+screen and Browse should both show the new values. Adding photos here
+**replaces** the whole set — the screen says so before you save.
+
+**8. Rate limit (optional, and it locks you out for an hour).** Post 10 jobs in
+quick succession; the 11th should fail with _"You have posted a lot of jobs in
+the last hour."_ Only do this on a throwaway account — there is no way to reset
+it except waiting.
+
+### Known gaps
+
+- **EXIF stripping is inferred, not proven.** Test 5 is the check. Until it has
+  been run, treat the claim as unverified.
+- **Location is not editable when editing a job.** `SELECT` on `jobs.location`
+  is revoked from clients, so the edit screen cannot read the current pin back
+  to show it — and showing the coarse point instead would overwrite a real
+  address with a rounded one on save. The screen says to cancel and repost to
+  move a job.
+- **Editing photos replaces all of them.** There is no per-photo delete, and the
+  old objects are left in the bucket.
+- **No photo cleanup anywhere.** Cancelled jobs keep their photos; replaced
+  photos are orphaned. Storage only grows.
+- **Description is optional.** Only title, category, budget and location are
+  required. Say if it should be mandatory.
+- **Still no screen run on a device by me**, and no automated test runner — the
+  sanitiser assertions are a throwaway script, not a suite that runs in CI.
+- **Fixture data still present.** The purge procedure from 2026-09-19 is still a
+  release blocker, and now also covers `job-photos`.
+
+---
+
+## 2026-09-19 — Phase 5 review fixes: what to re-test
+
+Six defects from the phase 5 review are fixed. Details and the security
+reasoning are in SECURITY.md; these are the checks that changed.
+
+### Re-test these
+
+**A. Editing a job that cannot be fetched.** Open My Jobs, then kill your
+network, then tap **Edit**. Expect an error message and a **Try again** button.
+Previously this was a spinner that never resolved — the error branch below the
+loading guard was unreachable.
+
+**B. Replacing photos actually replaces them.** Edit a job that has photos, add
+different ones, save, and reopen the detail screen.
+
+- The NEW photos should show. If you still see the old ones, the cache fix has
+  regressed.
+- Check Storage → `job-photos` → `{your-uid}/{jobId}/`. Only the current batch
+  should remain; the previous one should be gone.
+- Then paste the URL of a removed photo into a browser. It should **404**.
+  **This is the point of the fix** — a public bucket serves an orphaned file
+  forever, so taking a photo off a listing has to delete the object, or the
+  photo was never actually withdrawn.
+
+**C. Posting when photos fail.** Turn airplane mode on immediately after tapping
+**Post this job** (or pick a file that fails to process). Expect to STAY on the
+form, with a visible warning and a **Continue to your job** button. Previously
+the screen navigated away and the warning was set on an unmounting screen, so it
+was never rendered and photos silently went missing.
+
+**D. Small images are not upscaled.** Post a job using a small image (say
+300×300). The stored file should stay about that size rather than being blown up
+to 1600×1600. A portrait photo should come back with its LONGER side at 1600,
+not its width.
+
+Worth re-running the EXIF check from the phase 5 entry afterwards: the resize is
+now conditional, and it is the re-encode that strips metadata. The re-encode
+still runs for every image, including ones too small to resize — but that is
+exactly the kind of thing worth confirming rather than assuming.
+
+**E. A job with no budget can be edited.** Most test jobs have one, so make one
+without:
+
+```sql
+update public.jobs set budget = null where title = '<one of your test jobs>';
+```
+
+Open it in Edit, change the title, save. It should save. Previously validation
+rejected it on a field the user had never touched, making the job permanently
+uneditable. An empty budget field is now accepted and clears the value.
+
+**F. Duplicate photo selection.** In the photo picker, add the same image twice.
+It should appear once, and removing it should remove it cleanly.
+
+### Deferred, not fixed
+
+- **`usePostingLocation` reports failure too early.** With GPS denied and the
+  profile query still in flight it briefly says it could not find your
+  location. Transient and self-correcting once the profile loads.
+- **Over-long titles are silently truncated** at 140 characters rather than
+  flagged, because sanitising runs before validation — so the over-length branch
+  in `validateJobForm` is unreachable.

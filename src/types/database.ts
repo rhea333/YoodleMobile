@@ -87,6 +87,11 @@ export type JobRow = {
   coarse_lat: number | null;
   coarse_long: number | null;
   status: JobStatus;
+  /**
+   * Storage paths in the `job-photos` bucket, max 3. Paths, not URLs — see the
+   * note in migration 0014. Never null; the column defaults to an empty array.
+   */
+  photo_paths: string[];
   created_at: Timestamptz;
   updated_at: Timestamptz;
 };
@@ -100,6 +105,7 @@ export type JobInsert = {
   /** WKT, e.g. `SRID=4326;POINT(-79.3832 43.6532)`. Write-only; see file header. */
   location?: string | null;
   status?: JobStatus;
+  photo_paths?: string[];
 };
 
 export type JobUpdate = {
@@ -109,6 +115,7 @@ export type JobUpdate = {
   budget?: number | null;
   location?: string | null;
   status?: JobStatus;
+  photo_paths?: string[];
 };
 
 export type OfferRow = {

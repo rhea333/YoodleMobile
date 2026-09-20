@@ -1,4 +1,5 @@
 import type { ProfileRow, ProfileUpdate, Uuid } from '../types/database';
+import { prepareImageForUpload, readLocalFileBytes } from './images';
 import { supabase } from './supabase';
 
 /**
@@ -239,12 +240,23 @@ export const updateMyProfile = async (
 export type AvatarUploadResult = { ok: true; publicUrl: string; path: string } | ServiceFailure;
 
 /**
- * Validate, upload, and record a new avatar.
+ * Validate, strip metadata, upload, and record a new avatar.
  *
- * The object path is `{userId}/avatar.{ext}`. The leading folder is what the
+ * The object path is `{userId}/avatar.jpg`. The leading folder is what the
  * storage policies in 0009 check against `auth.uid()`, so one user can never
  * overwrite another's file. `upsert` is on so re-uploading replaces rather than
  * accumulating orphans.
+ *
+ * EXIF: the picked file is re-encoded through `prepareImageForUpload` before
+ * any bytes are uploaded. This replaces the previous reliance on the picker's
+ * `exif: false`, which only suppressed EXIF in the object returned to
+ * JavaScript and left the file — and therefore the upload — carrying whatever
+ * the camera wrote, GPS included, into a PUBLIC bucket. See SECURITY.md.
+ *
+ * Because re-encoding always produces JPEG, the extension is now fixed at
+ * `.jpg` rather than mirroring the source format. An avatar uploaded before
+ * this change may still sit at `avatar.png`; it stays referenced by its row
+ * until that user uploads again.
  */
 export const uploadMyAvatar = async (
   userId: Uuid,
@@ -255,12 +267,15 @@ export const uploadMyAvatar = async (
     return { ok: false, message: validation.message };
   }
 
-  // The documented React Native path: read the local URI into an ArrayBuffer.
-  // Blob/FormData are unreliable under Hermes.
-  let body: ArrayBuffer;
-  try {
-    body = await fetch(image.uri).then((response) => response.arrayBuffer());
-  } catch {
+  // Re-encode BEFORE reading any bytes, so what gets uploaded is the stripped
+  // copy and there is no path where the original file reaches Storage.
+  const prepared = await prepareImageForUpload(image.uri);
+  if (!prepared.ok) {
+    return { ok: false, message: prepared.message };
+  }
+
+  const body = await readLocalFileBytes(prepared.image.uri);
+  if (!body) {
     return { ok: false, message: 'Could not read that image from your device.' };
   }
 
@@ -274,11 +289,11 @@ export const uploadMyAvatar = async (
     return { ok: false, message: 'That image is too large. Please choose one under 5 MB.' };
   }
 
-  const path = `${userId}/avatar.${validation.extension}`;
+  const path = `${userId}/avatar.${prepared.image.extension}`;
 
   const { error: uploadError } = await supabase.storage
     .from(AVATAR_BUCKET)
-    .upload(path, body, { contentType: validation.mimeType, upsert: true });
+    .upload(path, body, { contentType: prepared.image.mimeType, upsert: true });
 
   if (uploadError) {
     return { ok: false, message: 'Could not upload that photo. Please try again.' };

@@ -1,11 +1,11 @@
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
-import { ActivityIndicator, ScrollView, Text, View } from 'react-native';
+import { ActivityIndicator, Image, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Avatar, Badge, Button, Card } from '../components';
 import { usePosterQuery, useJobQuery, useTheme } from '../hooks';
 import type { MainStackParamList } from '../navigation/types';
-import { formatBudget } from '../services';
+import { formatBudget, jobPhotoUrl } from '../services';
 import { spacing } from '../theme';
 
 type Props = NativeStackScreenProps<MainStackParamList, 'JobDetail'>;
@@ -68,6 +68,23 @@ export const JobDetailScreen = ({ route }: Props) => {
         {budget ? <Badge label={budget} tone="primary" /> : null}
         <Badge label={job.status === 'published' ? 'Open' : job.status} tone="success" withDot />
       </View>
+
+      {job.photo_paths.length > 0 ? (
+        <ScrollView
+          className="mt-lg"
+          contentContainerStyle={{ gap: spacing.sm }}
+          horizontal
+          showsHorizontalScrollIndicator={false}
+        >
+          {job.photo_paths.map((path) => (
+            <Image
+              className="h-48 w-64 rounded-lg"
+              key={path}
+              source={{ uri: jobPhotoUrl(path) }}
+            />
+          ))}
+        </ScrollView>
+      ) : null}
 
       <Text className="mb-xs mt-xl text-title font-semibold text-text-primary">Details</Text>
       <Text className="text-body text-text-secondary">

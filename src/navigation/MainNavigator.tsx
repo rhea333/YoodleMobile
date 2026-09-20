@@ -3,7 +3,15 @@ import {
   type NativeStackNavigationOptions,
 } from '@react-navigation/native-stack';
 
-import { CompleteProfileScreen, DesignSystemScreen, HomeScreen, JobDetailScreen } from '../screens';
+import {
+  CompleteProfileScreen,
+  DesignSystemScreen,
+  EditJobScreen,
+  HomeScreen,
+  JobDetailScreen,
+  MyJobsScreen,
+  PostJobScreen,
+} from '../screens';
 import type { MainStackParamList } from './types';
 
 const Stack = createNativeStackNavigator<MainStackParamList>();
@@ -35,6 +43,9 @@ export const MainNavigator = ({ needsOnboarding, screenOptions }: MainNavigatorP
     />
     <Stack.Screen component={HomeScreen} name="Home" options={{ title: 'Yoodle' }} />
     <Stack.Screen component={JobDetailScreen} name="JobDetail" options={{ title: 'Job' }} />
+    <Stack.Screen component={PostJobScreen} name="PostJob" options={{ title: 'Post a job' }} />
+    <Stack.Screen component={MyJobsScreen} name="MyJobs" options={{ title: 'My jobs' }} />
+    <Stack.Screen component={EditJobScreen} name="EditJob" options={{ title: 'Edit job' }} />
     {/*
       Dev-only. `__DEV__` is false in a release bundle, so this route is simply
       absent there rather than merely unlinked — there is nothing to deep-link

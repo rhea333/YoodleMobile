@@ -167,9 +167,22 @@ export const HomeScreen = ({ navigation }: Props) => {
         </ScrollView>
       ) : null}
 
-      <View className="mt-md flex-row items-center gap-xs">
-        <Chip label="List" onPress={() => setViewMode('list')} selected={viewMode === 'list'} />
-        <Chip label="Map" onPress={() => setViewMode('map')} selected={viewMode === 'map'} />
+      <View className="mt-md flex-row items-center justify-between">
+        <View className="flex-row items-center gap-xs">
+          <Chip label="List" onPress={() => setViewMode('list')} selected={viewMode === 'list'} />
+          <Chip label="Map" onPress={() => setViewMode('map')} selected={viewMode === 'map'} />
+        </View>
+        {/* Entry points to the phase 5 posting flow. The browse behaviour below
+            is untouched. */}
+        <View className="flex-row items-center gap-xs">
+          <Button
+            label="My jobs"
+            onPress={() => navigation.navigate('MyJobs')}
+            size="sm"
+            variant="ghost"
+          />
+          <Button label="Post a job" onPress={() => navigation.navigate('PostJob')} size="sm" />
+        </View>
       </View>
     </View>
   );

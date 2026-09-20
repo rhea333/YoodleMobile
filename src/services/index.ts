@@ -35,6 +35,36 @@ export type {
   PickedImage,
   ProfileResult,
 } from './profiles';
+export { prepareImageForUpload, readLocalFileBytes } from './images';
+export type { PreparedImage, PrepareImageResult } from './images';
+export {
+  MAX_JOB_DESCRIPTION_LENGTH,
+  MAX_JOB_TITLE_LENGTH,
+  MIN_JOB_TITLE_LENGTH,
+  sanitizeFreeText,
+  sanitizeJobDescription,
+  sanitizeJobTitle,
+} from './sanitize';
+export {
+  JOB_CATEGORIES,
+  JOB_PHOTO_BUCKET,
+  MAX_JOB_PHOTOS,
+  cancelJob,
+  createJob,
+  deleteJobPhotos,
+  jobPhotoUrl,
+  jobStatusLabel,
+  listMyJobs,
+  updateJob,
+  uploadJobPhotos,
+} from './jobs';
+export type {
+  CreateJobInput,
+  CreateJobResult,
+  JobCategory,
+  MyJobsResult,
+  UploadJobPhotosResult,
+} from './jobs';
 export {
   BROWSE_PAGE_SIZE,
   DEFAULT_RADIUS_METERS,

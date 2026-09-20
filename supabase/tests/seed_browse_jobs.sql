@@ -16,6 +16,13 @@
 
 begin;
 
+-- Migration 0014 added a 10-jobs-per-hour posting limit, and this fixture
+-- inserts 54 rows for a single poster. The trigger is suppressed for the
+-- duration of the seed and restored before commit — a fixture is not the thing
+-- the limit exists to stop, and leaving it off would silently disable the limit
+-- for everyone.
+alter table public.jobs disable trigger jobs_rate_limit;
+
 delete from public.jobs where title like 'Seed %';
 
 -- ---------------------------------------------------------------------------
@@ -76,5 +83,7 @@ select
   extensions.st_setsrid(extensions.st_point(-79.38, 43.66), 4326)::extensions.geography,
   'draft'
 from (select id from public.profiles where display_name = 'Account A' limit 1) p;
+
+alter table public.jobs enable trigger jobs_rate_limit;
 
 commit;

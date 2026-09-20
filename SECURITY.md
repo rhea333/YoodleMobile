@@ -1053,3 +1053,260 @@ Doing it needs more care than the `anon` case, because `authenticated`
 legitimately needs INSERT/UPDATE/DELETE on several tables and the delete
 policies in 0003–0006 have to be read first to work out the correct re-grant
 list. Worth folding into phase 5 alongside its new tables rather than rushing.
+
+---
+
+## 2026-09-19 — Phase 5: posting, and a correction to the phase 3 EXIF claim
+
+Phase 5 is the first time users put content INTO the app that other users see.
+That inverts the threat model from phase 4: the question is no longer what a
+browser can extract, but what a poster can inject.
+
+### CORRECTION — `exif: false` never stripped anything
+
+**The phase 3 entry in this file is wrong.** It recorded, under the avatar
+upload:
+
+> **`exif: false`** on the picker. EXIF can carry the GPS coordinates of where a
+> photo was taken…
+
+listing that option as the defence. It is not one. The SDK 57 docs describe
+`exif` as _"whether to also include the EXIF data for the image"_, and the
+asset's `exif` field as _"included if the `exif` option is truthy"_. The option
+controls whether EXIF is handed to **JavaScript**. It does not touch the file.
+Setting it to `false` means the app cannot see the metadata — not that the
+metadata is gone — and the upload carries the original bytes either way.
+
+So since phase 3, avatars have been uploaded with whatever EXIF the camera
+wrote, into a **public** bucket. For a photo taken at home, that includes
+`GPSLatitude`/`GPSLongitude`.
+
+The irony is worth recording: the comment in the code said this was to avoid
+undoing the location-privacy work in the schema, and it was the one thing in
+that chain that did nothing.
+
+**What actually strips EXIF is re-encoding.** `prepareImageForUpload`
+(`/src/services/images.ts`) decodes the image and writes a new JPEG from the
+pixels via `expo-image-manipulator`; source metadata is not part of that
+pipeline and does not survive it. Both upload paths now go through it:
+
+- job photos, in `uploadJobPhotos`;
+- avatars, in `uploadMyAvatar` — the phase 3 path, corrected here.
+
+`PhotoPicker` still passes `exif: false`, now with a comment saying plainly that
+it is not the protection, so nobody re-derives the wrong conclusion from it.
+
+**What is NOT verified.** The SDK docs do not state that re-encoding drops
+metadata — it follows from how the native decode/encode works, but it is
+inference, not a documented guarantee, and nothing here has run on a device.
+TESTING.md carries a manual check that downloads an uploaded photo and looks for
+an `Exif` marker in the bytes. **Treat this as unconfirmed until that check has
+been run.** Existing avatars uploaded before today were never re-encoded and
+should be assumed to carry EXIF; they are replaced on next upload.
+
+### Free-text sanitisation, and the escaping that is deliberately absent
+
+`/src/services/sanitize.ts` runs over every title and description, on the way
+in, in the service rather than only the screen — so a future non-form caller
+gets it too.
+
+**It does not escape HTML, on purpose.** Storing `&lt;b&gt;` in place of `<b>`
+is the usual reflex and it is wrong here. React Native's `<Text>` does not parse
+markup, so there is nothing to escape for any screen that exists; and escaping
+at write time corrupts the value for every later reader, which then
+double-escapes it or has to guess how to undo it. Escaping belongs at whatever
+render boundary actually interprets markup — a WebView, an email, a web
+dashboard — applied by that renderer against the text as typed. If chat or a
+web surface lands in a later phase, **that** is where escaping goes.
+
+What is removed is the class of characters that misbehave in any renderer:
+
+| Removed                                   | Why                                                                                                                                       |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| C0/C1 controls (not `\n`, `\t`)           | Break log lines and CSV exports; no legitimate use in a listing                                                                           |
+| Zero-width (U+200B–200D, U+2060, U+FEFF)  | Invisible, so two different strings look identical — evades word filters and fakes duplicates                                             |
+| Bidi overrides (U+202A–202E, U+2066–2069) | Reorder how text DISPLAYS without changing it, so a listing reads one way on screen and another in the database — the Trojan Source trick |
+
+Plus NFC normalisation, whitespace collapsing, and truncation. Validation runs
+on the sanitised value, not the raw one — otherwise a title of nothing but
+zero-width characters passes "is it empty" and then fails a CHECK constraint
+with an error no user can act on.
+
+Verified by compiling the module and running 13 assertions against it: bidi
+stripping, zero-width stripping, control characters, newline handling, blank
+line collapsing, NFC, truncation, an all-invisible title collapsing to empty,
+and HTML surviving untouched. All pass.
+
+Ceilings are mirrored server-side: `char_length(description) <= 4000` (0014) and
+the existing title constraint from 0003. Verified: a 4001-character description
+is rejected by the database.
+
+### Spam and abuse limits — implemented, not deferred
+
+The spec allowed logging this as an open item. It was cheap enough to enforce.
+
+`app.enforce_job_post_rate_limit` (0014) is a BEFORE INSERT trigger capping a
+poster at **10 jobs per rolling hour**, counting every status so deleting or
+cancelling does not refund the budget. In a trigger rather than the client for
+the obvious reason: a scripted poster does not run the client. Verified — the
+11th insert inside an hour is rejected.
+
+The client maps the error to _"You have posted a lot of jobs in the last hour"_
+rather than a generic failure, since it is a state the user can actually wait out.
+
+**What it does not stop, plainly:** it is per-account. Someone willing to
+register accounts can still flood a neighbourhood. That is a signup-side
+control — email verification, device or phone checks, or a global rate limit at
+the edge — and none of those exist yet. **Still open.**
+
+### Photo paths cannot be pointed at someone else's files
+
+Two independent checks, because the bucket is public and a listing renders
+whatever path its row holds:
+
+1. **Storage policies** (0014) confine writes to `{auth.uid()}/…`, so a user
+   cannot upload into another user's folder.
+2. **`app.validate_job_photo_paths`** rejects an INSERT or UPDATE whose
+   `photo_paths` do not all start with the row's own `poster_id`. Without this,
+   the policies would stop you writing someone else's file but not stop you
+   _recording_ their path against your listing — displaying their image as
+   yours.
+
+A trigger rather than a CHECK constraint because verifying "every element
+matches" needs to unnest the array, and PostgreSQL does not allow a subquery in
+a CHECK. Verified: a path under another user's uid is rejected, the poster's own
+is accepted, and a fourth photo is rejected by the count constraint.
+
+### The one place an exact location is captured
+
+`LocationPicker` is the only screen that captures a precise point, which is the
+intended design: `jobs.location` is exact, the ~1 km coarse point every browser
+sees is derived from it by trigger, and the exact value is released only through
+`job_exact_location()`. The screen says so to the poster rather than collecting
+it silently.
+
+The device GPS fix used to POSITION the map is still the rounded one from
+`useBrowseLocation` — it is a starting point, not the answer, so there was no
+reason to loosen that.
+
+### Outstanding
+
+- **EXIF stripping is unverified on a device.** The highest-priority item in
+  this entry. See TESTING.md.
+- **Existing avatars may carry EXIF** from before today's fix.
+- **Rate limiting is per-account only**; nothing stops multi-account abuse.
+- **No moderation or reporting.** Nothing lets a user flag a listing, and
+  nothing scans text or photos for abusive content. A public marketplace needs
+  both before real users.
+- **Orphaned photos are never cleaned up.** Replacing a job's photos uploads new
+  objects; the old ones stay in the bucket, and cancelling a job leaves its
+  photos entirely. Storage grows without bound.
+- **`get_advisors` still unavailable** — account role, not token scope. Two more
+  functions and a new bucket added this phase, still unlinted. Revisit before
+  phase 7 per the current plan; the SQL audit from 2026-09-19 is the substitute
+  and should be re-run.
+- **`authenticated` still holds TRUNCATE** and the other default grants.
+- **Fixture data and known-password test accounts** are still in the database.
+  Release blocker; see TESTING.md.
+
+---
+
+## 2026-09-19 — Phase 5 review: orphaned photos stay public
+
+A review of the phase 5 diff found eight defects. Six are fixed; two are
+deferred and logged below. One has a security consequence worth its own entry.
+
+### CORRECTION — and the exposure the earlier wording missed
+
+The phase 5 entry above says, of replaced photos, that "the old ones stay in the
+bucket". That was both imprecise and, more importantly, understated.
+
+**Imprecise:** photo paths were index-based (`{uid}/{jobId}/0.jpg`) and uploaded
+with `upsert: true`, so replacing photo 1 with photo 1 _overwrote_ the old
+object rather than leaving it. Old files only accumulated when a replacement set
+was SMALLER than the one before it.
+
+**Understated, and this is the part that matters:** `job-photos` is a **public**
+bucket. An object in it is fetchable by anyone with the URL, and that does not
+change when the `jobs` row stops pointing at it. So a poster who removes a photo
+from their listing has not withdrawn the photo. It remains retrievable by:
+
+- anyone who loaded the listing while that photo was on it, since the app
+  rendered the URL directly;
+- anyone who ever saw a shared or cached copy of that URL;
+- and permanently, because nothing expires it — the bucket is public, not
+  signed.
+
+Someone who posts a photo, realises it shows their house number or their car
+plate, and swaps it out would reasonably believe they had taken it down. Before
+this fix, they had not. That is a privacy failure of the same kind as the EXIF
+one: the user takes an action they believe protects them, and it does nothing.
+
+### What was changed
+
+**Fresh paths per save.** Photos now upload to `{uid}/{jobId}/{batch}-{n}.jpg`
+where `batch` is the save timestamp. This fixes the other half of the problem:
+stable paths plus `upsert` meant a replaced photo kept its public URL, so the
+image cache and the CDN carried on serving the previous picture — a poster would
+swap a photo and still see the old one. New path, new URL, no cache to defeat.
+It is the same reasoning behind the `?v=` on avatar URLs.
+
+**Explicit deletion of what is no longer referenced.** `deleteJobPhotos` removes
+the objects a save has stopped pointing at, called after the row update
+succeeds. The previous paths are captured BEFORE the mutation, because the
+mutation's `onSuccess` writes the new row into the query cache — reading them
+afterwards would find the new paths and conclude there was nothing to clean up.
+
+Deletion is deliberately **best-effort and non-fatal**: the row is already
+saved, so failing the whole edit over a failed storage delete would be worse.
+The cost of that choice is that a failed delete leaves an exposed orphan
+silently. See below.
+
+### Still open
+
+- **Cancelling a job does not remove its photos.** They stay in the public
+  bucket and stay fetchable. A poster who cancels a listing has not withdrawn
+  its images. This is the largest remaining case and it should be closed before
+  real users — most plausibly with a scheduled sweep that deletes objects under
+  `{uid}/{jobId}/` for jobs that are cancelled or deleted, since doing it
+  client-side depends on the client being there to do it.
+- **A failed delete is invisible.** `deleteJobPhotos` returns its outcome and
+  the caller ignores it. Nothing retries and nothing records it, so an orphan
+  created this way is never noticed.
+- **URLs already handed out stay valid until the object is deleted.** Deletion
+  is the only revocation available on a public bucket. If withdrawal needs to be
+  reliable, the bucket has to become private with signed URLs — a bigger change,
+  and the right one if listings ever carry sensitive images.
+- **No per-photo delete in the UI.** Editing replaces the whole set.
+
+### The other five fixes, briefly
+
+Not security-relevant, recorded so the diff is explicable:
+
+- The edit screen showed a spinner forever when the job fetch failed — the
+  `!values` guard ran before the error check, and `values` is derived from the
+  query data. Error branch now comes first and offers a retry.
+- Posting with a photo-upload failure navigated away and _then_ set the warning,
+  so it was set on an unmounting screen and never shown; the user reached their
+  job believing the photos had attached. It now stays put and offers a way
+  through.
+- The image re-encode resized unconditionally, upscaling small images and
+  letting portrait photos exceed the intended cap because it constrained width
+  rather than the longest edge. It now only downscales, and caps the longer
+  side. The re-encode still runs when no resize is needed — that re-encode is
+  what strips EXIF, so skipping it for small images would have quietly
+  reintroduced the phase 3 bug.
+- `jobs.budget` is nullable, but the edit form required a positive number, so a
+  job without a budget could never be edited at all.
+- Duplicate picked photos collided on React keys, making one delete remove both.
+
+### Deferred, with reasons
+
+- **`usePostingLocation` reports "unavailable" too early.** With GPS denied and
+  the profile query still in flight, `postalFsa` is `undefined`, so the hook
+  concludes it cannot guess before it has anything to guess from. Cosmetic and
+  transient — it corrects itself as soon as the profile loads.
+- **The over-long title branch in `validateJobForm` is unreachable**, because
+  `sanitizeJobTitle` truncates first. Over-long titles are silently truncated
+  rather than flagged. Harmless, but the dead branch is misleading and should
+  either validate before sanitising or be removed.
