@@ -10,12 +10,14 @@ import {
   EditJobScreen,
   HomeScreen,
   JobDetailScreen,
+  LeaveReviewScreen,
   MakeOfferScreen,
   MyJobsScreen,
   NotificationsScreen,
   OffersScreen,
   PayoutSetupScreen,
   PostJobScreen,
+  ProfileScreen,
 } from '../screens';
 import type { MainStackParamList } from './types';
 
@@ -68,6 +70,12 @@ export const MainNavigator = ({ needsOnboarding, screenOptions }: MainNavigatorP
       options={{ title: 'Notifications' }}
     />
     <Stack.Screen component={PayoutSetupScreen} name="PayoutSetup" options={{ title: 'Payouts' }} />
+    <Stack.Screen component={ProfileScreen} name="Profile" options={{ title: 'Profile' }} />
+    <Stack.Screen
+      component={LeaveReviewScreen}
+      name="LeaveReview"
+      options={{ title: 'Leave a review' }}
+    />
     {/*
       Dev-only. `__DEV__` is false in a release bundle, so this route is simply
       absent there rather than merely unlinked — there is nothing to deep-link

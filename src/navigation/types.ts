@@ -39,6 +39,19 @@ export type MainStackParamList = {
   /** Stripe Connect onboarding, so a worker can be paid. */
   PayoutSetup: undefined;
   /**
+   * Somebody's public profile — rating, bio and the reviews written about them.
+   * `userId` only; everything shown is what the 0008 column grants return.
+   */
+  Profile: { userId: string };
+  /**
+   * Rate the other party on a completed job.
+   *
+   * `jobId` ONLY, deliberately. Who is being reviewed is derived from the job
+   * and its accepted offer, never passed in — a route param naming the reviewee
+   * would be a caller-supplied claim about who they worked with.
+   */
+  LeaveReview: { jobId: string };
+  /**
    * DEV ONLY. The component gallery kept from phase 1. `MainNavigator`
    * registers this route only when `__DEV__`, so navigating to it in a release
    * build is not possible — the route does not exist there.

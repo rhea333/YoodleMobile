@@ -11,6 +11,7 @@ import {
   useBrowseLocation,
   useDebouncedValue,
   useNearbyCategories,
+  useSession,
   useTheme,
 } from '../hooks';
 import type { MainStackParamList } from '../navigation/types';
@@ -69,6 +70,8 @@ export const HomeScreen = ({ navigation }: Props) => {
   const insets = useSafeAreaInsets();
   const { colors } = useTheme();
   const queryClient = useQueryClient();
+  const { session } = useSession();
+  const userId = session?.user.id;
 
   const unreadCount = useNotificationsStore(selectUnreadCount);
   const clearNotifications = useNotificationsStore((state) => state.clear);
@@ -95,6 +98,13 @@ export const HomeScreen = ({ navigation }: Props) => {
   const hasFilters = category !== null || search.trim().length > 0;
 
   const handleSignOut = async () => {
+    // NOT cleared here: review-prompt dismissals. Their storage key is
+    // namespaced by user id, so the next account to sign in on this device
+    // reads its own key and never sees the previous one's — the isolation the
+    // query cache and notification feed need a wipe to achieve, that store
+    // already has by construction. Clearing it would only throw away the
+    // signed-out user's own dismissals, so every prompt they had deliberately
+    // dismissed would return the next time they signed in.
     await signOut();
     // Drop every cached query with the session. Without this, the next account
     // to sign in on this device would briefly see the previous one's profile
@@ -198,6 +208,16 @@ export const HomeScreen = ({ navigation }: Props) => {
         {/* Entry points to the phase 5 posting flow. The browse behaviour below
             is untouched. */}
         <View className="flex-row items-center gap-xs">
+          {/* Your own profile, as other people see it — rating and reviews
+              included. The only way in to your own reputation. */}
+          {userId ? (
+            <Button
+              label="Profile"
+              onPress={() => navigation.navigate('Profile', { userId })}
+              size="sm"
+              variant="ghost"
+            />
+          ) : null}
           <Button
             label="Payouts"
             onPress={() => navigation.navigate('PayoutSetup')}

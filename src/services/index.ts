@@ -97,9 +97,35 @@ export type { InboxHandlers, MessageResult, MessagesResult, SendMessageInput } f
 export {
   MAX_MESSAGE_LENGTH,
   MAX_OFFER_MESSAGE_LENGTH,
+  MAX_REVIEW_COMMENT_LENGTH,
   sanitizeMessageBody,
   sanitizeOfferMessage,
+  sanitizeReviewComment,
 } from './sanitize';
+export {
+  MAX_RATING,
+  MIN_RATING,
+  formatRating,
+  formatReviewCount,
+  getMyReviewForJob,
+  getProfileRating,
+  getReviewEligibility,
+  listProfileRatings,
+  listReviewsForProfile,
+  submitReview,
+} from './reviews';
+export type {
+  ProfileRating,
+  ProfileRatingResult,
+  ProfileRatingsResult,
+  ReviewEligibility,
+  ReviewEligibilityResult,
+  ReviewListResult,
+  ReviewWithReviewer,
+  SubmitReviewInput,
+  SubmitReviewResult,
+} from './reviews';
+export { dismissReviewPrompt, isReviewPromptDismissed } from './reviewPrompts';
 export {
   JOB_CATEGORIES,
   JOB_PHOTO_BUCKET,

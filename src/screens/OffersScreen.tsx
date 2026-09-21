@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { ActivityIndicator, RefreshControl, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { Badge, Button, Card } from '../components';
+import { Badge, Button, Card, RatingSummary, type RatingState } from '../components';
 import {
   useAcceptAndPayMutation,
   useMyOffersQuery,
@@ -11,6 +11,7 @@ import {
   useOfferActionMutation,
   useOfferContextQuery,
   useOffersOnMyJobsQuery,
+  useProfileRatingsQuery,
   useSession,
   useTheme,
 } from '../hooks';
@@ -69,6 +70,36 @@ export const OffersScreen = ({ navigation }: Props) => {
     allOffers.map((offer) => offer.job_id),
     allOffers.map((offer) => offer.worker_id),
   );
+
+  // Ratings for every person on this screen in ONE read: the workers who bid on
+  // your jobs, and the posters of the jobs you bid on. A hook per card is not
+  // possible and a read per card would be absurd.
+  //
+  // GATED ON EVERY SOURCE HAVING SETTLED. Poster ids come from `context`, which
+  // resolves after the offer lists do — so building the id list eagerly means
+  // the query key changes mid-flight and the whole thing refetches. Waiting
+  // costs nothing (the cards render either way) and makes it one read.
+  const listsReady = !received.isPending && !sent.isPending && !context.isPending;
+
+  const ratedIds = listsReady
+    ? [
+        ...(received.data ?? []).map((offer) => offer.worker_id),
+        ...(sent.data ?? [])
+          .map((offer) => context.data?.jobsById[offer.job_id]?.poster_id)
+          .filter((id): id is string => typeof id === 'string'),
+      ]
+    : [];
+
+  const ratings = useProfileRatingsQuery(ratedIds);
+
+  // An unknown rating must never render as "No reviews yet" — that is a claim
+  // about a person, and a failed query would otherwise leave every worker on
+  // the screen permanently described as unrated.
+  const ratingState: RatingState = ratings.isError
+    ? 'unavailable'
+    : !listsReady || ratings.isPending
+      ? 'loading'
+      : 'ready';
 
   const [pendingId, setPendingId] = useState<string | null>(null);
   const offerAction = useOfferActionMutation({ onSuccess: () => setPendingId(null) });
@@ -133,7 +164,16 @@ export const OffersScreen = ({ navigation }: Props) => {
         title={workerName(offer.worker_id)}
         variant="outlined"
       >
-        <View className="flex-row flex-wrap items-center gap-xs">
+        <View className="mt-xs">
+          <RatingSummary
+            average={ratings.data?.[offer.worker_id]?.average ?? null}
+            compact
+            count={ratings.data?.[offer.worker_id]?.count ?? 0}
+            state={ratingState}
+          />
+        </View>
+
+        <View className="mt-md flex-row flex-wrap items-center gap-xs">
           <Badge label={offerStatusLabel(offer.status)} tone={statusTone(offer.status)} withDot />
           <Badge label={formatBudget(offer.amount) ?? '—'} tone="primary" />
           {paymentBadge(offer.job_id)}
@@ -151,6 +191,12 @@ export const OffersScreen = ({ navigation }: Props) => {
         ) : null}
 
         <View className="mt-md flex-row flex-wrap gap-sm">
+          <Button
+            label="Profile"
+            onPress={() => navigation.navigate('Profile', { userId: offer.worker_id })}
+            size="sm"
+            variant="secondary"
+          />
           <Button
             label="Message"
             onPress={() =>
@@ -196,6 +242,17 @@ export const OffersScreen = ({ navigation }: Props) => {
 
     return (
       <Card key={offer.id} subtitle="Your offer" title={jobTitle(offer.job_id)} variant="outlined">
+        {posterId ? (
+          <View className="mb-md">
+            <RatingSummary
+              average={ratings.data?.[posterId]?.average ?? null}
+              compact
+              count={ratings.data?.[posterId]?.count ?? 0}
+              state={ratingState}
+            />
+          </View>
+        ) : null}
+
         <View className="flex-row flex-wrap items-center gap-xs">
           <Badge label={offerStatusLabel(offer.status)} tone={statusTone(offer.status)} withDot />
           <Badge label={formatBudget(offer.amount) ?? '—'} tone="primary" />
@@ -207,19 +264,46 @@ export const OffersScreen = ({ navigation }: Props) => {
         ) : null}
 
         <View className="mt-md flex-row flex-wrap gap-sm">
-          {posterId ? (
+          {/*
+            The worker's way into the job — and therefore into the review
+            prompt once it is complete. Before migration 0018 a worker could not
+            read a job that had left `published` at all.
+
+            GATED ON THE JOB ACTUALLY BEING READABLE. `context` only contains
+            jobs RLS returned, so a losing bidder on a job that has since left
+            `published` has no entry here — and rendering the button anyway
+            sends them to "This job is no longer available." The adjacent
+            buttons are gated the same way, via `posterId` from the same row.
+          */}
+          {job ? (
             <Button
-              label="Message"
-              onPress={() =>
-                navigation.navigate('Chat', {
-                  jobId: offer.job_id,
-                  otherUserId: posterId,
-                  otherUserName: 'The poster',
-                })
-              }
+              label="View job"
+              onPress={() => navigation.navigate('JobDetail', { jobId: offer.job_id })}
               size="sm"
               variant="secondary"
             />
+          ) : null}
+          {posterId ? (
+            <>
+              <Button
+                label="Profile"
+                onPress={() => navigation.navigate('Profile', { userId: posterId })}
+                size="sm"
+                variant="secondary"
+              />
+              <Button
+                label="Message"
+                onPress={() =>
+                  navigation.navigate('Chat', {
+                    jobId: offer.job_id,
+                    otherUserId: posterId,
+                    otherUserName: 'The poster',
+                  })
+                }
+                size="sm"
+                variant="secondary"
+              />
+            </>
           ) : null}
           {offer.status === 'pending' ? (
             <Button

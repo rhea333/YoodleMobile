@@ -2118,6 +2118,170 @@ The case that used to break the screen outright. Reaching it takes some setup:
 - **Fixture data and known-password accounts still present.** Still a release
   blocker.
 
+
+---
+
+## 2026-09-21 — Phase 8: reviews and profiles
+
+**Nothing here has been run.** Migration 0018 is written and not applied; the
+screens have not been opened. Note also that `list_migrations` shows **0017 is
+already applied** to the remote project even though phase 7's functions were
+never deployed — so the database is a phase ahead of the Edge Functions.
+
+### Setup
+
+```
+supabase db push --project-ref aovsfxypbdoppezlyjus
+```
+
+Phase 8 reads a **completed** job, and a job only reaches `completed` when
+`stripe-release-payment` transfers successfully. So the phase 7 walkthrough is a
+prerequisite, not an optional predecessor: deploy the functions from that
+section first, or you will have nothing to review.
+
+If `supabase db push` fails on `reviews_one_per_job_per_reviewer` with a 23505,
+the table already holds a reviewer with two reviews on one job. That is
+pre-0018 data and needs a human decision about which to keep — the migration
+deliberately will not pick for you.
+
+### A. The prompt appears once for each side
+
+1. Run a job end to end: post, offer, accept & pay, mark complete. Both
+   accounts now have a completed job.
+2. **As the poster**, open the job from My Jobs → View. A "How did it go?" card
+   should sit above the title, naming the worker.
+3. **As the worker**, open Offers → Your offers → **View job**. The same card
+   should appear, naming the poster.
+   - *This button is new.* Before 0018 a worker could not read a job that had
+     left `published`, so if the job title shows as "A job" here, 0018 did not
+     apply.
+4. Leave a review from one side. Reopen the job: **the prompt is gone**, and it
+   stays gone on relaunch.
+
+### B. Dismissing does not block anything, and sticks
+
+1. On the other account, tap the **×** on the prompt.
+2. The card disappears; the screen stays where it is and everything else on it
+   still works. Navigate away and back — still gone.
+3. **Force-quit and reopen.** Still gone. (This is the AsyncStorage path; if it
+   returns, the write failed, which is the intended failure direction.)
+4. The review itself is still available — the prompt is gone, not the ability.
+   There is deliberately no other entry point, so dismissing means "not now"
+   until a future phase adds one.
+
+### C. A second review is blocked — in the database, not the UI
+
+The UI check is easy to confirm and is **not the test that matters**:
+
+1. After reviewing, navigating to the review screen for that job shows "You
+   have already reviewed this job" instead of a form.
+
+Now bypass the UI entirely. With the reviewer's own access token:
+
+```sh
+curl -i -X POST 'https://aovsfxypbdoppezlyjus.supabase.co/rest/v1/reviews' \
+  -H "apikey: $PUBLISHABLE_KEY" \
+  -H "Authorization: Bearer $REVIEWER_ACCESS_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"job_id":"<JOB>","reviewer_id":"<ME>","reviewee_id":"<THEM>","rating":1}'
+```
+
+**Expected: 409, code `23505`,** naming
+`reviews_one_per_job_per_reviewer`. Run it twice more — same answer every time.
+A 201 here means the constraint did not apply and the migration needs checking.
+
+### D. The counterparty rule (the phase's main security fix)
+
+This is the one that was actually broken. You need a **third** account that bid
+on the job and lost.
+
+1. Have account C make an offer on the job, and decline it. Complete the job
+   with account B as before.
+2. **As C, try to review the poster:**
+
+```sh
+curl -i -X POST '.../rest/v1/reviews' \
+  -H "Authorization: Bearer $LOSING_BIDDER_TOKEN" ... \
+  -d '{"job_id":"<JOB>","reviewer_id":"<C>","reviewee_id":"<POSTER>","rating":1}'
+```
+
+   **Expected: 403 / `42501` row-level security violation.** Before 0018 this
+   *succeeded* — that is the hole.
+
+3. **As the poster, try to review C** (the losing bidder):
+   same call, reviewer = poster, reviewee = C. **Expected: 403.** This also
+   succeeded before 0018.
+4. **As an account with no connection to the job at all:** 403.
+5. **Self-review**, reviewer = reviewee: expect a CHECK violation on
+   `reviews_no_self_review`, not an RLS error — the table refuses it regardless
+   of policy.
+
+### E. Reviewing an incomplete job
+
+1. Set up a job that is accepted and paid but **not** marked complete.
+2. Open it as either party: **no prompt**.
+3. Force the insert with curl anyway. **Expected: 403** —
+   `app.job_has_status(job_id, 'completed')` fails.
+
+### F. The average recalculates
+
+1. Note the worker's rating on their profile (Offers → Profile, or Home →
+   Profile for your own). A fresh account shows **"No reviews yet"**, not zero
+   stars — confirm that specifically, since an unrated person rendering as a
+   zero-star person is the failure worth catching.
+2. Leave a **5**. The profile should show **5.0 (1 review)**.
+3. Complete a second job with the same worker and leave a **4**.
+4. The profile should now read **4.5 (2 reviews)**. Pull to refresh if you are
+   looking at a screen that was already open.
+5. Check the view directly:
+
+```sql
+select * from public.profile_ratings where profile_id = '<WORKER>';
+```
+
+   `rating_avg` should be `4.50` and `rating_count` `2`. Because this is a view
+   and not a stored column, these cannot disagree — if they ever do, the bug is
+   in the app's caching, not the data.
+
+### G. The profile screen
+
+1. **About tab**: name, FSA area, bio, rating summary. Confirm there is **no
+   full postal code, no email, and no job history** — the 0008 column grants are
+   what stop that, so nothing here should be able to show them.
+2. **Reviews tab**: individual reviews, newest first, each with the reviewer's
+   name, photo, stars and date. A review left without a comment should render as
+   stars and a date with **no empty quote block**.
+3. The reviews list is lazy — it should not fetch until the tab is opened.
+4. Open **someone else's** profile (Offers → Profile) and **your own** (Home →
+   Profile). Empty states should read "X has no reviews yet" vs "You have no
+   reviews yet".
+
+### H. Accessibility
+
+1. With a screen reader on, the read-only rating announces once — "Rated 4.5 out
+   of 5 from 2 reviews" — rather than five separate star nodes.
+2. The star **input** exposes five radio buttons, each labelled "1 star" … "5
+   stars", with the chosen one selected.
+3. Confirm filled and empty stars differ by **glyph** (★ vs ☆) and not only by
+   colour.
+
+### Known gaps
+
+- **Nothing in this section has been executed.** Every claim is the intended
+  behaviour of unrun code, and 0018 has not been applied.
+- **No automated test covers reviews.** Case D is the one to automate first —
+  it is the actual security fix, it needs three accounts, and it is tedious
+  enough by hand that it will quietly stop being run.
+- **No moderation.** Reviews cannot be reported, hidden or replied to. See
+  SECURITY.md; this belongs with the phase 6 block-and-report blocker.
+- **The prompt has one entry point.** Dismiss it and the only way back to
+  reviewing that job is the job detail screen; there is no "jobs awaiting your
+  review" list.
+- **The reviews list is unpaginated.** Fine at this size, not at a thousand.
+- **Fixture data and known-password accounts still present.** Still a release
+  blocker.
+
+
 ---
 
 ## 2026-09-21 — One accepted offer per job: how to verify it
@@ -2251,3 +2415,93 @@ locked out of reviewing with no explanation.
   two accounts, two offers and genuine parallelism, which is exactly the kind of
   test that stops being run by hand.
 
+
+---
+
+## 2026-09-21 — Phase 8 review fixes: what to re-check
+
+Six fixes, none of which change the database. **Not run** — the app has still
+not been opened against a deployed stack.
+
+Most of these are only visible in states that are awkward to reach on purpose,
+so the throttling and offline notes below matter more than usual.
+
+### A. A slow rating never reads as "no reviews"
+
+The bug was a claim about a person made from not having asked yet, so the test
+is about what appears *during* the request, not after it.
+
+1. Throttle the network hard (Charles, or iOS Settings → Developer → Network
+   Link Conditioner → "Edge").
+2. Open a job posted by a **well-reviewed** account.
+3. Watch the "Posted by" card as it loads. **Expected: a muted `★ …`
+   placeholder**, then the real rating.
+4. **It must never read "No reviews yet" at any point.** That is the whole
+   assertion; if you blink and miss it, throttle harder rather than assuming.
+5. Repeat on Offers and on a profile screen.
+
+### B. A failed rating read stays silent
+
+The Offers case was the serious one — one failed query described everyone on
+the page as unrated.
+
+1. Open Offers with several offers visible from rated people.
+2. Put the device in airplane mode and pull to refresh, **or** block
+   `*/rest/v1/profile_ratings*` in a proxy and reload.
+3. **Expected: the rating line disappears entirely** from each card.
+4. **Expected NOT: "No reviews yet" on anybody.** Before this fix, that is what
+   every card showed, and it persisted until a successful refetch.
+5. Restore the network, pull to refresh, confirm ratings return.
+
+### C. A new review updates the average on Offers
+
+This is the case that silently broke documented test F in the phase 8 section.
+
+1. Note a worker's rating on the **Offers** screen — say `★ 5.0 · 1 review`.
+2. Complete another job with them and leave a **4**, without force-quitting.
+3. Go back to Offers. **Expected: `★ 4.5 · 2 reviews`, without a manual pull to
+   refresh.** Before the fix it kept 5.0 for the rest of the session, because
+   the mutation invalidated the per-profile key and not the batched one.
+4. Also confirm the profile screen and Job Detail updated.
+
+### D. Dismissals survive a sign-out
+
+1. Complete a job and **dismiss** the review prompt with the ×.
+2. Sign out. Sign back in **as the same account**.
+3. Open that job. **Expected: the prompt stays dismissed.** Before this fix,
+   signing out wiped your own dismissals and every one of them came back.
+4. Now confirm the isolation that the removed code was wrongly credited with:
+   sign out, sign in as a **different** account that also has a completed job,
+   and confirm that account sees its own prompt normally and has no dismissals
+   inherited from the first.
+
+### E. "View job" is not a dead end
+
+1. As a worker, bid on a job and have the poster **decline** it.
+2. Have the poster take the job to `assigned` or `completed` with someone else,
+   so it leaves `published`.
+3. Open Offers → Your offers and find the declined bid. **Expected: no "View
+   job" button** — the job is not readable by you, and the button would only
+   lead to "This job is no longer available."
+4. On an **accepted** offer for a completed job, the button **is** present and
+   opens the job with the review prompt on it.
+
+### F. One read, not two
+
+Cheap to check and it confirms the query is gated correctly:
+
+1. With the network inspector open, load the Offers screen.
+2. **Expected: a single request to `profile_ratings`.** Two means the id list
+   is being built before `context` has settled and the query key is changing
+   mid-flight.
+
+### Known gaps
+
+- **None of this has been run.** As with everything since phase 7, these are
+  intended behaviours of code that has not executed.
+- **Cases A and B need deliberate network interference** and will not happen by
+  accident during ordinary testing — which is exactly why both bugs survived
+  review of the working app.
+- **No automated coverage.** C is the most automatable (it is a cache
+  invalidation assertion, not a UI timing one) and the most likely to regress
+  silently, since nothing about the screen looks wrong when it is stale.

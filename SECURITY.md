@@ -2008,6 +2008,180 @@ screen. This change surfaces the messages that were always intended to be seen.
 - **`get_advisors` still unavailable.**
 - **Block and report still unbuilt** — unchanged since phase 6.
 
+
+---
+
+## 2026-09-21 — Phase 8: reviews, and two holes in a table written five phases ago
+
+The `reviews` table has existed since migration 0006. Nothing had ever written
+to it, and building the UI is what finally made anyone read its rules
+carefully. Two of them were wrong — not subtly, and not theoretically.
+
+### 1. Anyone who bid could review, and be reviewed
+
+`reviews_insert_participant` (0006) read as "a participant may review a
+participant". What it actually said was:
+
+```
+app.is_job_participant(job_id)                     -- poster OR anyone who bid
+and (
+  app.is_job_poster_id(job_id, reviewee_id)
+  or app.has_offer_on_job_as(job_id, reviewee_id)  -- ...about anyone who bid
+)
+```
+
+`app.is_job_participant` answers **"poster or has an offer on this job"**, not
+"poster or the worker who did the job". So on a completed job:
+
+- the poster could leave a one-star review for **every worker who bid and
+  lost**, each of whom never worked for them; and
+- **every losing bidder** could review the poster.
+
+That is reputation damage with no transaction behind it, from someone you never
+dealt with, and it is trivially automatable — bid on a hundred jobs, review a
+hundred posters. On a marketplace where the rating is the thing strangers use to
+decide whether to let each other into their homes, this is the load-bearing
+constraint, and it was not bearing any load.
+
+**Fixed in 0018.** `reviews_insert_counterparty` requires one of exactly two
+shapes: poster reviewing the **accepted** worker, or the **accepted** worker
+reviewing the poster. Both directions need `app.is_accepted_worker_as`, a new
+two-argument helper — 0006 only had the caller-scoped `app.is_accepted_worker`,
+which is why the policy reached for the looser `has_offer_on_job_as` instead.
+
+The job must still be `completed`, and that got stronger for free in phase 7:
+`completed` is now written by `stripe-release-payment` after a transfer lands,
+not by anyone tapping a button. A review can no longer be used as leverage
+mid-job because the status it depends on is set by money moving.
+
+### 2. The unique constraint was per pair, not per reviewer
+
+The brief asks for **one review per job per reviewer**. 0006 enforced
+`unique (job_id, reviewer_id, reviewee_id)`, which is one review per job per
+*pair*. It stops reviewing the same person twice on a job; it does not stop one
+reviewer writing several reviews on one job against different people.
+
+That only had teeth because of hole 1 — with the counterparty rule in place
+there is only ever one person to review — but defence in depth is the whole
+argument for putting this in the database, so the constraint now says what the
+product means:
+
+```sql
+alter table public.reviews
+  add constraint reviews_one_per_job_per_reviewer unique (job_id, reviewer_id);
+```
+
+Strictly stronger than what it replaced: uniqueness on `(job_id, reviewer_id)`
+implies uniqueness on the triple, so nothing previously rejected is now
+accepted. The migration deliberately does **not** clean up pre-existing
+duplicates — if the ADD fails with 23505 that is a decision for a person, not
+something a migration should resolve by deleting somebody's review.
+
+### Why this is in the database and not the UI
+
+The screens check all of it: `LeaveReviewScreen` refuses to render a form for an
+ineligible job, and the prompt does not appear unless the job is complete and
+unreviewed. **None of that is the control.** A replayed insert never runs a line
+of TypeScript. The rules that matter are `reviews_insert_counterparty`,
+`reviews_one_per_job_per_reviewer`, `reviews_no_self_review` and
+`reviews_rating_range`, and the app is written on the assumption that it is the
+second line of defence rather than the first.
+
+`submitReview` reflects that in how it fails. A `23505` becomes "You have
+already reviewed this job" — the duplicate guard firing is an expected outcome,
+not a crash. An RLS refusal gets a deliberately **non-specific** message:
+naming which clause failed would describe the policy to whoever is probing it.
+
+### Self-review
+
+Unchanged and already correct: `reviews_no_self_review` is a table CHECK
+(`reviewer_id <> reviewee_id`), so it holds regardless of policy. 0018 also
+states it in the policy, which is redundant — the two counterparty branches
+already make it unreachable, since nobody is both a job's poster and its
+accepted worker (`offers_insert_own` refuses a bid on your own job). Kept
+because a reader of the policy should not have to go and check that.
+
+### A third thing, found on the way: the worker could not see their own job
+
+`jobs_select_published` covers `status = 'published'`; `jobs_select_own` covers
+the poster. **Nothing covered the accepted worker.** The moment a job left
+`published`, the person actually doing it could no longer read it — so they
+could not see it was complete, nor who the poster was, which is precisely what
+they need in order to review them. (It is also why an accepted job has been
+rendering as "A job" on the worker's side of the Offers screen since phase 6.)
+
+`jobs_select_accepted_worker` (0018) fixes it. **It exposes no new columns.**
+The 0003 grant gives `authenticated` the coarse location only; `location_exact`
+is not in it and is unreadable by every client role. And the accepted worker is
+already trusted with strictly more — `job_exact_location` (0007) hands them the
+precise point on request — so this policy is narrower than access they had
+already been given.
+
+### The rating view
+
+`profile_ratings` aggregates on read rather than denormalising onto `profiles`:
+
+```sql
+create view public.profile_ratings with (security_invoker = true) as
+  select reviewee_id as profile_id, round(avg(rating), 2), count(*)::integer
+  from public.reviews group by reviewee_id;
+```
+
+`security_invoker = true` changes nothing today, and is there anyway. Without
+it the view runs as its **owner**, so it would keep returning aggregates if
+`reviews` were ever restricted — quietly becoming a channel for summarising rows
+the caller is no longer allowed to read. Reviews are public now; the view should
+not be the thing that survives that decision being revisited.
+
+Chosen over trigger-maintained columns because derived data stored in two places
+eventually disagrees, and a stale average is invisible — nothing surfaces it,
+and there is no error to notice. Computed on read it cannot drift.
+
+### Review content is sanitised
+
+`sanitizeReviewComment` gives review text the same treatment as a chat message,
+for a sharper reason. A review is **public, permanent, and unanswerable**. Bidi
+control characters let a comment read as praise on the page and as something
+else in the database; on the one surface the subject cannot reply to, that is
+worth ruling out at the point of entry.
+
+### What the dismissal store is not
+
+"I dismissed the review prompt for this job" lives in AsyncStorage, namespaced
+by user id. Three things about that are deliberate:
+
+- **It is not a security control and not the duplicate guard.** AsyncStorage is
+  unencrypted and user-clearable. What stops a second review is the unique
+  constraint; what stops the prompt returning after a review is written is the
+  review row.
+- **Nothing sensitive is in it.** Job ids and a user id. No ratings, no
+  comments, no names.
+- **It is cleared on sign-out**, for the same reason the query cache and the
+  notification feed are: the next account on this device must not inherit the
+  previous one's state.
+
+Failure mode is deliberately one-directional: every read error resolves to "not
+dismissed". Being asked once more is a smaller problem than a screen that will
+not render.
+
+### Outstanding
+
+- **0018 is not applied.** Written and unrun. Note that 0017 *is* applied to the
+  remote project, so the migration list and the deploy state disagree — the
+  payments schema is live while its Edge Functions are not.
+- **Reviews are permanently public and cannot be reported or removed.** There is
+  no moderation path: no report, no takedown, no right of reply. A single unfair
+  one-star is currently forever, and `reviews_delete_own` lets only the author
+  remove it. This is a launch blocker in the same family as block-and-report,
+  which is still unbuilt from phase 6.
+- **No rate limiting on review writes.** The counterparty rule bounds it in
+  practice — one review per completed job you were actually party to — so there
+  is no volume to abuse without doing the jobs first.
+- **`get_advisors` still unavailable**, now across six phases.
+- Everything still outstanding from phase 7 remains: refunds, disputes,
+  authorisation expiry, fixture accounts.
+
+
 ---
 
 ## 2026-09-21 — One accepted offer per job (migration 0019)
@@ -2120,3 +2294,88 @@ exist in the database.
   cancel. The migration deliberately does not choose.
 - Everything outstanding from phases 7 and 8 is unchanged.
 
+
+---
+
+## 2026-09-21 — Phase 8 review fixes, and a correction to the entry above
+
+Six findings from the phase 8 review, fixed. Most are correctness rather than
+security, but two belong here: one because it corrects a claim this file makes
+a few sections up, and one because "unknown" being rendered as a fact about a
+person is a trust problem even when it is not an access-control problem.
+
+### Correction: the dismissal store does NOT need clearing on sign-out
+
+The phase 8 entry above says review-prompt dismissals are "cleared on sign-out,
+for the same reason the query cache and the notification feed are: the next
+account on this device must not inherit the previous one's state."
+
+**That reasoning is wrong, and the code that implemented it was a bug.**
+
+The storage key is `yoodle.reviewPrompt.dismissed.${userId}`. It is namespaced
+by user, so the next account to sign in reads its own key and cannot see the
+previous one's. The isolation the query cache and the notification feed need a
+wipe to achieve, this store already had by construction — those two are global
+and genuinely do need clearing, which is what made the analogy tempting.
+
+What the clear actually did was throw away **the departing user's own**
+dismissals. Sign out and back in, and every prompt they had deliberately
+dismissed came back. The call is removed, and `clearReviewPromptDismissals` and
+`listDismissedReviewPrompts` are deleted rather than left as unused exports.
+
+Worth naming the failure mode: the original was reasoning by analogy to two
+adjacent stores without checking whether the property that made them need a
+wipe applied here. It produced a real regression AND a paragraph in this file
+asserting a rationale that was never true.
+
+### "Unknown" must not render as "unrated"
+
+`RatingSummary` took `average: number | null` and rendered null as **"No
+reviews yet"**. Every caller passed `query.data?.average ?? null`, so a rating
+that was still loading, or whose query had failed, rendered as a definite
+statement that the person has no reviews.
+
+On Job Detail that was a flicker. On the Offers screen it was worse: the
+batched ratings query covers everyone on the page, so a single failed read
+described **every worker on the screen** as unrated, permanently, with no
+recovery short of a refetch.
+
+This is the same argument the phase 8 entry makes for why an unrated person
+must not render as zero stars — "new" and "badly rated" are opposite signals to
+somebody deciding whether to let a stranger into their home. The argument was
+right and applied one case too narrowly: "we have not asked yet" and "we asked
+and it failed" are also not statements about the person.
+
+`RatingSummary` now takes an explicit three-state `state` prop — `ready`,
+`loading`, `unavailable` — and only `ready` claims anything. Loading shows a
+muted placeholder; unavailable renders nothing at all. All four call sites pass
+it, including ProfileScreen, which had hand-rolled the pending case and would
+still have shown a failed read as "No reviews yet".
+
+### The rest
+
+- **Stale averages after writing a review.** `useSubmitReviewMutation` named
+  three specific query keys to invalidate and missed the batched
+  `reviewKeys.ratings([...])` that Offers reads, so that screen kept the
+  pre-review average for the session. It now invalidates the `reviewKeys.all`
+  prefix. The batched key is a sorted id list and cannot be targeted from a
+  mutation that knows one reviewee, so the prefix is the only correct answer,
+  not merely the convenient one.
+- **A dead-end button.** The "View job" button added for workers in phase 8 was
+  rendered unconditionally. For a pending or declined bidder on a job that has
+  left `published`, no RLS policy applies, so it led to "This job is no longer
+  available." It is now gated on the job being present in the offer context —
+  i.e. on RLS having actually returned it — like the buttons beside it.
+- **A type that lied.** `ProfileRatingRow.rating_avg` was typed `string | null`
+  on the stated premise that PostgREST quotes `numeric` to protect precision.
+  It does not; it emits an unquoted JSON number. Harmless in practice because
+  the only reader coerces with `Number()`, but it would have type-checked a
+  future `.startsWith()` straight into a runtime crash — precisely what a
+  hand-maintained type exists to prevent.
+
+### Outstanding
+
+- Unchanged from the two entries above: 0018 and 0019 are both unapplied, the
+  phase 7 Edge Functions are undeployed, and none of the phase 8 walkthrough has
+  been run.
+- Reviews still have no moderation path. Still a launch blocker.

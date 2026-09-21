@@ -38,6 +38,17 @@ export {
   useReleasePaymentMutation,
   useStartPayoutOnboardingMutation,
 } from './usePayments';
+export {
+  reviewKeys,
+  useDismissReviewPromptMutation,
+  useMyReviewForJobQuery,
+  useProfileRatingQuery,
+  useProfileRatingsQuery,
+  useReviewEligibilityQuery,
+  useReviewPromptDismissedQuery,
+  useReviewsForProfileQuery,
+  useSubmitReviewMutation,
+} from './useReviews';
 export { useRealtimeInbox } from './useRealtimeInbox';
 export { threadKeys, useSendMessageMutation, useThreadQuery, useThreadRealtime } from './useThread';
 export { usePostingLocation } from './usePostingLocation';

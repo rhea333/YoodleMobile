@@ -210,6 +210,27 @@ export type ReviewUpdate = {
 };
 
 /**
+ * One row of `public.profile_ratings` — the aggregate rating view (0018).
+ *
+ * A profile with no reviews has NO ROW here rather than a row of zeroes. That
+ * is the honest shape: zero is not a valid rating, and "unrated" is a different
+ * statement from "rated badly". Callers treat a missing row as "no reviews
+ * yet".
+ *
+ * `rating_avg` is `numeric` in Postgres and arrives as a JSON NUMBER. An
+ * earlier version of this type claimed it was a string, on the theory that
+ * PostgREST quotes numerics to protect their precision. It does not — it emits
+ * them unquoted. The lie was harmless because the only reader coerces with
+ * `Number()`, but it type-checked any future string method into a runtime
+ * crash, which is exactly the failure a hand-written type is supposed to stop.
+ */
+export type ProfileRatingRow = {
+  profile_id: Uuid;
+  rating_avg: number | null;
+  rating_count: number;
+};
+
+/**
  * One row of `public.browse_jobs(...)` — the paginated browse read.
  *
  * `lat`/`long` are the COARSE point, rounded to ~1 km. There is deliberately no
@@ -319,7 +340,18 @@ export type Database = {
         Relationships: [];
       };
     };
-    Views: Record<string, never>;
+    Views: {
+      // Read-only by construction: a grouped view is not updatable, and only
+      // SELECT is granted (0018). `Record<string, never>` for the write types
+      // for the same reason spelled out on `messages` — `never` would collapse
+      // every table's write types, not just this one.
+      profile_ratings: {
+        Row: ProfileRatingRow;
+        Insert: Record<string, never>;
+        Update: Record<string, never>;
+        Relationships: [];
+      };
+    };
     Functions: {
       job_exact_location: {
         Args: { p_job_id: Uuid };

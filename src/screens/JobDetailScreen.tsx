@@ -1,9 +1,28 @@
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
-import { ActivityIndicator, Image, ScrollView, Text, View } from 'react-native';
+import { ActivityIndicator, Image, Pressable, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { Avatar, Badge, Button, Card } from '../components';
-import { usePaymentForJobQuery, usePosterQuery, useJobQuery, useSession, useTheme } from '../hooks';
+import {
+  Avatar,
+  Badge,
+  Button,
+  Card,
+  RatingSummary,
+  ReviewPrompt,
+  type RatingState,
+} from '../components';
+import {
+  useDismissReviewPromptMutation,
+  useJobQuery,
+  useMyReviewForJobQuery,
+  usePaymentForJobQuery,
+  usePosterQuery,
+  useProfileRatingQuery,
+  useReviewEligibilityQuery,
+  useReviewPromptDismissedQuery,
+  useSession,
+  useTheme,
+} from '../hooks';
 import type { MainStackParamList } from '../navigation/types';
 import {
   formatBudget,
@@ -27,6 +46,12 @@ type Props = NativeStackScreenProps<MainStackParamList, 'JobDetail'>;
  *
  * "Apply" is an inert placeholder. It is rendered disabled rather than omitted
  * so the layout is the real one when the offers phase wires it up.
+ *
+ * ON THE REVIEW PROMPT: it appears here because this is the one screen BOTH
+ * parties can reach for a given job. It renders only when the job is complete,
+ * this user was actually party to it, they have not reviewed it, and they have
+ * not dismissed it. Every one of those is re-checked by the database on insert;
+ * see migration 0018.
  */
 export const JobDetailScreen = ({ navigation, route }: Props) => {
   const { jobId } = route.params;
@@ -36,9 +61,42 @@ export const JobDetailScreen = ({ navigation, route }: Props) => {
 
   const jobQuery = useJobQuery(jobId);
   const posterQuery = usePosterQuery(jobQuery.data?.poster_id);
+  const posterRating = useProfileRatingQuery(jobQuery.data?.poster_id);
+  // Without this the card asserts "No reviews yet" for a well-reviewed poster
+  // for as long as the query is in flight — a claim about a person, made from
+  // not having asked yet.
+  const posterRatingState: RatingState = posterRating.isError
+    ? 'unavailable'
+    : posterRating.isPending
+      ? 'loading'
+      : 'ready';
   // Returns null for anyone who is not the payer or payee — RLS decides, so a
   // browser looking at someone else's job simply sees no payment section.
   const paymentQuery = usePaymentForJobQuery(jobId);
+
+  // Reputation only becomes relevant once the job is done, so none of these
+  // fire on an open listing. Hooks still run unconditionally — the gate is the
+  // `enabled` flag, not an early return, because hook order cannot vary.
+  const userId = session?.user.id;
+  const isComplete = jobQuery.data?.status === 'completed';
+
+  const reviewEligibility = useReviewEligibilityQuery(jobId, userId, isComplete);
+  const myReview = useMyReviewForJobQuery(jobId, userId, isComplete);
+  const promptDismissed = useReviewPromptDismissedQuery(jobId, userId, isComplete);
+  const dismissPrompt = useDismissReviewPromptMutation();
+
+  const counterpartyId = reviewEligibility.data?.counterpartyId ?? undefined;
+  const counterparty = usePosterQuery(counterpartyId);
+
+  // Every condition must be a definite yes. `promptDismissed.data === false`
+  // rather than `!promptDismissed.data` so the prompt does not flash into view
+  // while the storage read is still pending.
+  const showReviewPrompt =
+    isComplete &&
+    Boolean(userId) &&
+    counterpartyId != null &&
+    myReview.data === null &&
+    promptDismissed.data === false;
 
   if (jobQuery.isPending) {
     return (
@@ -72,6 +130,17 @@ export const JobDetailScreen = ({ navigation, route }: Props) => {
         paddingBottom: insets.bottom + spacing['2xl'],
       }}
     >
+      {showReviewPrompt && userId && counterpartyId ? (
+        <View className="mb-lg">
+          <ReviewPrompt
+            counterpartyName={counterparty.data?.display_name ?? 'this neighbour'}
+            counterpartyRole={reviewEligibility.data?.counterpartyRole ?? 'worker'}
+            onDismiss={() => dismissPrompt.mutate({ jobId, userId })}
+            onLeaveReview={() => navigation.navigate('LeaveReview', { jobId })}
+          />
+        </View>
+      ) : null}
+
       <Text className="text-heading font-bold text-text-primary">{job.title}</Text>
 
       <View className="mt-md flex-row flex-wrap items-center gap-xs">
@@ -137,28 +206,48 @@ export const JobDetailScreen = ({ navigation, route }: Props) => {
       {posterQuery.isPending ? (
         <ActivityIndicator color={colors.primary} />
       ) : poster ? (
-        <Card padding="sm" variant="filled">
-          <View className="flex-row items-center">
-            <Avatar
-              name={poster.display_name ?? undefined}
-              size="lg"
-              uri={poster.avatar_url ?? undefined}
-            />
-            <View className="ml-md flex-1">
-              <Text className="text-bodyLarge font-semibold text-text-primary">
-                {poster.display_name ?? 'A neighbour'}
-              </Text>
-              {poster.postal_fsa ? (
-                <Text className="mt-px text-footnote text-text-secondary">
-                  {poster.postal_fsa} area
+        /*
+          The whole card opens the profile. A rating is only useful next to the
+          reviews behind it, and the tap target for "who is this person" should
+          be the block showing who they are, not a separate link.
+        */
+        <Pressable
+          accessibilityHint="Opens their profile and reviews"
+          accessibilityLabel={`${poster.display_name ?? 'A neighbour'}, view profile`}
+          accessibilityRole="button"
+          className="active:opacity-70"
+          onPress={() => navigation.navigate('Profile', { userId: job.poster_id })}
+        >
+          <Card padding="sm" variant="filled">
+            <View className="flex-row items-center">
+              <Avatar
+                name={poster.display_name ?? undefined}
+                size="lg"
+                uri={poster.avatar_url ?? undefined}
+              />
+              <View className="ml-md flex-1">
+                <Text className="text-bodyLarge font-semibold text-text-primary">
+                  {poster.display_name ?? 'A neighbour'}
                 </Text>
-              ) : null}
+                {poster.postal_fsa ? (
+                  <Text className="mt-px text-footnote text-text-secondary">
+                    {poster.postal_fsa} area
+                  </Text>
+                ) : null}
+                <View className="mt-xs">
+                  <RatingSummary
+                    average={posterRating.data?.average ?? null}
+                    count={posterRating.data?.count ?? 0}
+                    state={posterRatingState}
+                  />
+                </View>
+              </View>
             </View>
-          </View>
-          {poster.bio ? (
-            <Text className="mt-md text-body text-text-secondary">{poster.bio}</Text>
-          ) : null}
-        </Card>
+            {poster.bio ? (
+              <Text className="mt-md text-body text-text-secondary">{poster.bio}</Text>
+            ) : null}
+          </Card>
+        </Pressable>
       ) : (
         <Text className="text-body text-text-muted">
           This poster&rsquo;s profile is unavailable.
