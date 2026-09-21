@@ -2007,3 +2007,116 @@ screen. This change surfaces the messages that were always intended to be seen.
 - **Rotate the Stripe secret key** and the Supabase PAT.
 - **`get_advisors` still unavailable.**
 - **Block and report still unbuilt** — unchanged since phase 6.
+
+---
+
+## 2026-09-21 — One accepted offer per job (migration 0019)
+
+Found by the phase 8 review, from the wrong end. `getReviewEligibility` asks
+"who is the accepted worker on this job?" and hit a job that could have two
+answers. The review symptom was trivial. **What it was a symptom of was not.**
+
+### What was actually wrong
+
+Nothing had ever stopped a poster accepting more than one offer on the same
+job, and since phase 7 wired accepting to paying, that meant **a poster with
+three bids could place three separate card holds on one job.**
+
+Four layers all check something adjacent to this and none of them checked it:
+
+| Layer | What it actually enforces |
+| --- | --- |
+| `offers_one_per_worker_per_job` (0004) | one WORKER cannot bid twice |
+| 0016 trigger | one ROW's transition: `old.status` must be `pending` |
+| `stripe-authorize-payment` | job not cancelled/completed; this offer is pending/accepted |
+| OffersScreen | renders "Accept & pay" on every pending offer |
+
+Two rows that are both `pending` pass the trigger independently. Two different
+offers have two different ids, so phase 7's careful per-offer idempotency —
+`unique (offer_id)`, intent reuse, `authorize:{offerId}` keys — is working
+exactly as designed and provides no protection at all. **Every key is
+legitimately distinct.** This is worth sitting with: the defence was thorough,
+correct, and aimed one level below where the problem was.
+
+It survived two phases and a security review each time because every individual
+check reads as sufficient in isolation.
+
+### The fix
+
+```sql
+create unique index offers_one_accepted_per_job
+  on public.offers (job_id)
+  where status = 'accepted';
+```
+
+**Partial, and in the database.** Partial because any number of pending,
+declined or withdrawn offers must still coexist — only the accepted one is
+exclusive. In the database because an application check cannot win this race:
+two concurrent requests can both read "no accepted offer yet" before either
+writes. Only the index can decide which one loses.
+
+### Error handling, and why no hold is placed
+
+`stripe-authorize-payment` now refuses in two places, and the distinction
+between them is the point:
+
+1. **Before any Stripe call**, by querying for a rival accepted offer. This is
+   the ordinary path — one poster, two taps on different offers, seconds apart.
+   It returns 409 `offer_already_accepted` having created nothing, so there is
+   nothing to clean up.
+2. **On the `offers` update**, where the index rejects the loser of a genuinely
+   concurrent accept with 23505. Check (1) cannot catch this and is not
+   expected to. This path has created a PaymentIntent, and it cancels it before
+   returning 409 with the same code.
+
+**Neither path places a hold on a card**, and path (2) is worth being precise
+about rather than hand-waving. A `capture_method: 'manual'` PaymentIntent does
+not authorise anything at creation. The hold appears at **confirmation**, when
+the card is attached client-side via PaymentSheet. Path (2) fails server-side,
+before the client secret is ever returned, so no card was attached, no
+confirmation happened, and the intent is cancelled on the way out. The
+cardholder sees nothing — not a pending charge, not a released one.
+
+The raw constraint violation is not surfaced. A 23505 with an index name is a
+description of the schema to whoever is probing it; the caller gets "Another
+offer on this job was accepted first."
+
+### A consequence, stated deliberately
+
+Accepting is now irreversible at the offer level. The 0016 trigger already
+refused to move an offer out of `accepted`, so the accepted row cannot be
+declined to free the index. A poster who changes their mind cancels the JOB,
+which since phase 7's `stripe-cancel-payment` voids the hold properly.
+
+This is not a new restriction — 0016 already made acceptance terminal. The
+index only stops the poster ALSO accepting somebody else while that stands.
+
+### Defence in depth in the app
+
+`getReviewEligibility` no longer uses `.maybeSingle()` on the accepted offer,
+**even though 0019 now makes two impossible**. `.maybeSingle()` throws PGRST116
+the moment the invariant is false, converting a data problem into "neither
+party can ever review this job" with nothing to explain it. It now reads the
+list and decides:
+
+- caller is one of the accepted workers → counterparty is the poster. Correct
+  whether there is one accepted offer or five, so never ambiguous.
+- caller is the poster, one accepted offer → that worker.
+- caller is the poster, more than one → **refuse and log**, rather than pick.
+  Silently attaching a rating to an arbitrary one of two real people is the
+  worse outcome and it cannot be undone afterwards.
+
+The last branch should now be unreachable. It is there because this exact
+invariant was assumed and false for two phases, and rows from that window still
+exist in the database.
+
+### Outstanding
+
+- **0019 is not applied, and the concurrent case is not verified.** See
+  TESTING.md — the procedure is written and has not been run.
+- **Existing data may already violate it.** If `db push` fails with 23505, a
+  job already has two accepted offers, and those jobs may have two Stripe holds
+  against them. Both need a person: which offer stands, and which hold to
+  cancel. The migration deliberately does not choose.
+- Everything outstanding from phases 7 and 8 is unchanged.
+

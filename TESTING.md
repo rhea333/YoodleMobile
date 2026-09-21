@@ -2117,3 +2117,137 @@ The case that used to break the screen outright. Reaching it takes some setup:
 - **Authorisations still expire after ~7 days** and nothing detects it.
 - **Fixture data and known-password accounts still present.** Still a release
   blocker.
+
+---
+
+## 2026-09-21 — One accepted offer per job: how to verify it
+
+**Not yet run.** The procedure below is written against unapplied migration
+0019 and an undeployed `stripe-authorize-payment`. Every expected result is
+what the code should do, not what it was observed doing.
+
+### Before you start: check for existing violations
+
+Run this BEFORE `db push`, because the migration will fail on a dirty table and
+it is better to know why first:
+
+```sql
+select job_id, count(*) as accepted_offers
+from public.offers
+where status = 'accepted'
+group by job_id
+having count(*) > 1;
+```
+
+Empty is the happy path. Any rows mean phase 6/7 already let a job be
+double-accepted, and **each of those jobs may have more than one Stripe hold
+against it.** Before deciding which offer stands, check the Stripe dashboard for
+PaymentIntents in `requires_capture` on that job and cancel the ones that lose.
+
+```
+supabase db push --project-ref aovsfxypbdoppezlyjus
+supabase functions deploy stripe-authorize-payment --project-ref aovsfxypbdoppezlyjus
+```
+
+### A. The ordinary case — two taps, seconds apart
+
+1. Post a job and get **two different workers** to bid on it.
+2. Accept the first: **Accept & pay**, card `4242 4242 4242 4242`. Confirm the
+   payment badge reads **Held**.
+3. Now tap **Accept & pay** on the second offer.
+4. **Expected:** the error banner reads *"You have already accepted another
+   offer on this job. Cancel the job if you want to start again."*
+5. **Stripe's PaymentSheet must not open.** This is the specific thing to watch
+   for — path (1) returns before any Stripe call, so if a card sheet appears at
+   all, the early check did not run.
+6. In the Stripe dashboard, confirm there is **exactly one** PaymentIntent for
+   this job. Not two, and not one plus a cancelled one.
+
+### B. The concurrent case — the one the index exists for
+
+Check A cannot catch a true race, so this test deliberately bypasses the app.
+Get the poster's access token and both offer ids, then fire both at once:
+
+```sh
+JWT="<POSTER_ACCESS_TOKEN>"
+URL="https://aovsfxypbdoppezlyjus.supabase.co/functions/v1/stripe-authorize-payment"
+
+for OFFER in "<OFFER_A>" "<OFFER_B>"; do
+  curl -s -o "/tmp/resp-$OFFER.json" -w "%{http_code}\n" -X POST "$URL" \
+    -H "Authorization: Bearer $JWT" \
+    -H 'Content-Type: application/json' \
+    -d "{\"offerId\":\"$OFFER\"}" &
+done
+wait
+cat /tmp/resp-*.json
+```
+
+`&` and `wait` matter — sequential curls just re-test case A.
+
+**Expected: one 200 with a `clientSecret`, one 409 with
+`"code":"offer_already_accepted"`.** Which one wins is not deterministic and
+does not matter; that exactly one wins is the whole assertion.
+
+Two 200s means the index is not present — re-check that `db push` applied 0019.
+
+Then confirm the database agrees:
+
+```sql
+select id, worker_id, status from public.offers where job_id = '<JOB>';
+```
+
+**Exactly one `accepted`.**
+
+### C. The loser leaves no hold
+
+This is the assertion that actually protects the cardholder, and it is separate
+from B passing.
+
+1. After B, open the Stripe dashboard → Payments, filtered to this job.
+2. **Expected:** one PaymentIntent from the winner, in `requires_payment_method`
+   (the client secret was returned but the sheet was never completed). The
+   loser's intent is either absent or `canceled` — never `requires_capture`.
+3. **On the poster's actual card statement / test-mode customer: no pending
+   authorisation from the losing request.** A manual-capture intent authorises
+   nothing until it is confirmed client-side, and the losing request fails
+   server-side before its client secret is ever returned.
+4. Check the payment rows:
+
+```sql
+select p.id, p.offer_id, p.status from public.payments p where p.job_id = '<JOB>';
+```
+
+   The loser's row, if one exists, is `canceled`.
+
+### D. Reviews survive a job that already has two accepted offers
+
+Belt-and-suspenders, for pre-0019 data. You cannot create this state any more,
+so force it — on a **test project only**, and drop the index first:
+
+```sql
+drop index public.offers_one_accepted_per_job;
+update public.offers set status = 'accepted' where id = '<SECOND_OFFER>';
+```
+
+1. Complete the job and open it as the **poster**. Expected: no review prompt,
+   and opening the review screen says *"This job has more than one accepted
+   offer, so we cannot tell who to review."* — **not** a crash, and **not** a
+   review silently attached to one of the two workers.
+2. Open it as **either accepted worker**. Expected: the prompt appears
+   normally, because the person they review is the poster either way.
+3. Recreate the index afterwards.
+
+Before this change, step 1 threw PGRST116 and both parties were permanently
+locked out of reviewing with no explanation.
+
+### Known gaps
+
+- **None of this has been executed.** 0019 is unapplied and the function is
+  undeployed.
+- **Case B needs real concurrency**, and a loopback `curl` on one machine is a
+  weak approximation of it. It is good enough to prove the index fires; it is
+  not a load test.
+- **No automated coverage.** Case B is the one worth automating first — it needs
+  two accounts, two offers and genuine parallelism, which is exactly the kind of
+  test that stops being run by hand.
+

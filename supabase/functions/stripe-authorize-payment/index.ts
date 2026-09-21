@@ -22,6 +22,24 @@
 // does NOT block the hold. It blocks the RELEASE. Refusing here would be worse
 // for both parties — the poster could not accept at all — and refusing at
 // release means nothing is ever captured that cannot be paid out.
+//
+// ONE ACCEPTED OFFER PER JOB (migration 0019). The idempotency above is all
+// per-OFFER, and that is not the only way to end up with two holds on one job:
+// accepting two DIFFERENT offers produces two legitimately distinct offer ids,
+// two distinct idempotency keys and two distinct payment rows, and every check
+// above passes. This function now refuses that in two places:
+//
+//   1. Before touching Stripe, by looking for a rival accepted offer. This is
+//      the ordinary path and it costs one query.
+//   2. On the `offers` update, where `offers_one_accepted_per_job` rejects the
+//      loser of a concurrent accept with 23505. Check (1) CANNOT catch this —
+//      two requests can both read "no accepted offer yet" before either
+//      writes, so only the index can decide it.
+//
+// In both cases NO HOLD IS PLACED. Path (1) returns before any Stripe call at
+// all. Path (2) has created a PaymentIntent but never confirmed it, and an
+// unconfirmed intent has no authorisation on any card — it is cancelled on the
+// way out regardless.
 
 import {
   CURRENCY,
@@ -33,6 +51,9 @@ import {
   supabaseAdmin,
   toCents,
 } from '../_shared/stripe.ts';
+
+/** Postgres unique-violation. Here: somebody else was accepted first. */
+const UNIQUE_VIOLATION = '23505';
 
 Deno.serve(async (req: Request) => {
   if (req.method === 'OPTIONS') return preflight();
@@ -92,6 +113,38 @@ Deno.serve(async (req: Request) => {
             job.status === 'cancelled'
               ? 'This job has been cancelled, so it cannot be paid for.'
               : 'This job is already complete.',
+        },
+        409,
+      );
+    }
+
+    // Has this poster already accepted somebody else for this job?
+    //
+    // `.limit(1)` on an array rather than `.maybeSingle()`: this query runs on
+    // data that predates 0019, where a job CAN still have two accepted offers,
+    // and `.maybeSingle()` would throw on exactly the broken rows this check
+    // exists to notice.
+    const { data: rivals, error: rivalError } = await supabaseAdmin
+      .from('offers')
+      .select('id, worker_id')
+      .eq('job_id', job.id)
+      .eq('status', 'accepted')
+      .neq('id', offerId)
+      .limit(1);
+
+    if (rivalError) {
+      console.error('stripe-authorize-payment could not check rival offers', rivalError);
+      return json({ error: 'Could not check this job. Please try again.' }, 500);
+    }
+
+    if (rivals && rivals.length > 0) {
+      // Deliberately BEFORE any Stripe call: nothing is created, so there is
+      // nothing to cancel and no possibility of a stray hold.
+      return json(
+        {
+          error:
+            'You have already accepted another offer on this job. Cancel the job if you want to start again.',
+          code: 'offer_already_accepted',
         },
         409,
       );
@@ -208,11 +261,33 @@ Deno.serve(async (req: Request) => {
 
     if (acceptError) {
       console.error('stripe-authorize-payment could not accept the offer', acceptError);
+
+      // Unwind Stripe first, before deciding what to say. The intent was
+      // created but NEVER CONFIRMED — no card has been attached to it and no
+      // authorisation exists — so cancelling it leaves the poster's card
+      // untouched. Doing this on every failure path, not just the expected
+      // one, is what keeps a stray intent from lingering.
       await stripe.paymentIntents.cancel(intent.id).catch(() => undefined);
       await supabaseAdmin
         .from('payments')
         .update({ status: 'canceled', last_error: `accept failed: ${acceptError.message}` })
         .eq('id', payment.id);
+
+      // 23505 on `offers_one_accepted_per_job` means we lost a concurrent
+      // accept: another offer on this job became accepted between our check
+      // above and this write. That is the index doing its job, not a fault, so
+      // it gets a 409 and a sentence a person can act on rather than a 500 and
+      // a raw constraint name.
+      if (acceptError.code === UNIQUE_VIOLATION) {
+        return json(
+          {
+            error:
+              'Another offer on this job was accepted first. Only one offer per job can be accepted.',
+            code: 'offer_already_accepted',
+          },
+          409,
+        );
+      }
 
       return json({ error: 'Could not accept that offer. Please try again.' }, 500);
     }
