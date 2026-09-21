@@ -29,6 +29,15 @@ export {
   useOffersOnMyJobsQuery,
 } from './useOffers';
 export type { OfferAction } from './useOffers';
+export {
+  paymentKeys,
+  useAcceptAndPayMutation,
+  useMyPaymentsQuery,
+  usePaymentForJobQuery,
+  usePayoutStatusQuery,
+  useReleasePaymentMutation,
+  useStartPayoutOnboardingMutation,
+} from './usePayments';
 export { useRealtimeInbox } from './useRealtimeInbox';
 export { threadKeys, useSendMessageMutation, useThreadQuery, useThreadRealtime } from './useThread';
 export { usePostingLocation } from './usePostingLocation';

@@ -6,7 +6,17 @@ module.exports = [
   // Must stay last among configs so it can switch off stylistic rules Prettier owns.
   prettierConfig,
   {
-    ignores: ['node_modules/**', '.expo/**', 'dist/**', 'android/**', 'ios/**', 'expo-env.d.ts'],
+    ignores: [
+      'node_modules/**',
+      '.expo/**',
+      'dist/**',
+      'android/**',
+      'ios/**',
+      'expo-env.d.ts',
+      // Deno, not React Native. Different globals and module specifiers; the
+      // app's rules would only produce false positives here.
+      'supabase/functions/**',
+    ],
   },
   {
     files: ['**/*.{ts,tsx}'],

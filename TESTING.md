@@ -1734,3 +1734,386 @@ the Message button.
 - Both automated suites need the three `p6-*` accounts, and both are covered by
   the purge procedure — which will break them. That is the right trade: nothing
   with a known password should survive into a build real people use.
+
+---
+
+## 2026-09-20 — Phase 7: payments
+
+**Nothing in this phase has been run.** The Edge Functions are written but not
+deployed, because the Supabase account's role returns 403 on the Management API
+(the same block as `get_advisors`). Setup comes first, and it is all yours.
+
+### Verified automatically
+
+- `npx tsc --noEmit`, `npx eslint .`, `npx prettier --check .` — all exit 0.
+- `npx expo export --platform ios` — 1493 modules, so `@stripe/stripe-react-native`
+  and `expo-web-browser` resolve in the bundle.
+- Migration 0017 applied, and the grants checked directly: `payments` grants
+  SELECT and nothing else; the four Stripe id columns and `last_error` are
+  ungranted; `has_column_privilege` on `profiles.stripe_account_id` is **false**
+  for both `anon` and `authenticated`.
+
+**Not** verified: the Deno functions are not typechecked (`deno` is not
+installed here, and `supabase/functions` is excluded from the app's `tsc` — it
+is a different runtime). `deno check supabase/functions/**/*.ts` before deploying
+is worth the thirty seconds.
+
+---
+
+### Setup — do this first, in order
+
+**1. Unblock the Supabase account.** Edge Function deploy and secrets need
+Owner or Administrator on org `vkdjxnmgxfckctdlqrfn`. Until that is fixed
+nothing below works.
+
+**2. Turn on Stripe Connect.** Stripe dashboard → Connect → get started, in
+**test mode**. Express accounts must be enabled.
+
+**3. Set the secret key.**
+
+```sh
+supabase secrets set STRIPE_SECRET_KEY=sk_test_... --project-ref aovsfxypbdoppezlyjus
+```
+
+**4. Deploy the functions.** The webhook must have JWT verification OFF —
+Stripe has no Supabase credentials and authenticates by signature instead.
+
+```sh
+supabase functions deploy stripe-connect-onboarding --project-ref aovsfxypbdoppezlyjus
+supabase functions deploy stripe-authorize-payment  --project-ref aovsfxypbdoppezlyjus
+supabase functions deploy stripe-release-payment    --project-ref aovsfxypbdoppezlyjus
+supabase functions deploy stripe-webhook --no-verify-jwt --project-ref aovsfxypbdoppezlyjus
+```
+
+**5. Create the webhook endpoint.** Stripe dashboard → Developers → Webhooks →
+Add endpoint:
+
+```
+https://aovsfxypbdoppezlyjus.supabase.co/functions/v1/stripe-webhook
+```
+
+Subscribe to: `payment_intent.amount_capturable_updated`,
+`payment_intent.succeeded`, `payment_intent.payment_failed`,
+`payment_intent.canceled`, `account.updated`.
+
+**6. Set the signing secret** (shown once, when the endpoint is created):
+
+```sh
+supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_... --project-ref aovsfxypbdoppezlyjus
+```
+
+Without it the webhook **fails closed** and returns 500 on every event. That is
+deliberate, not a bug.
+
+**7. Restart Expo** with `npx expo start --clear` — `EXPO_PUBLIC_*` values are
+inlined at build time.
+
+---
+
+### Test cards
+
+Any future expiry date, any 3-digit CVC, any postal code.
+
+| Card                  | What it does                                           |
+| --------------------- | ------------------------------------------------------ |
+| `4242 4242 4242 4242` | succeeds                                               |
+| `4000 0025 0000 3155` | **requires authentication** (3D Secure), then succeeds |
+| `4000 0000 0000 0002` | declined — generic                                     |
+| `4000 0000 0000 9995` | declined — insufficient funds                          |
+| `4000 0000 0000 9987` | declined — lost card                                   |
+
+For Connect onboarding in test mode, Stripe accepts placeholder data. Canada:
+
+- SIN `000000000`
+- phone `000 000 0000`
+- any address; use a real-format postal code
+- bank: transit `11000`, institution `000`, account `000123456789`
+- Stripe's test onboarding also offers a "skip this step" shortcut on most pages
+
+---
+
+### The walkthrough
+
+You need **two accounts** — the `p6-poster` and `p6-worker` accounts from phase 6
+work. Poster and worker on separate devices or sessions.
+
+**A. Worker sets up payouts.** As the worker: Home → **Payouts** → **Set up
+payouts**. Stripe's hosted page opens in a browser. Complete it with the test
+data above and return to the app.
+
+- Status should become **Ready**. If it says _In review_, tap **Refresh status**
+  — the flip depends on the `account.updated` webhook arriving.
+- Confirm in the database that the worker's flag moved and that the app never
+  saw the account id:
+
+```sql
+select display_name, stripe_payouts_enabled, stripe_details_submitted
+from public.profiles where display_name like 'P6 %';
+```
+
+**B. Successful payment — the happy path.** Poster posts a job; worker offers on
+it. As the poster: **Offers** → **Accept & pay** → Stripe's sheet opens →
+`4242 4242 4242 4242`.
+
+- The offer becomes **Accepted** and a **Held** badge appears.
+- **Confirm the money is held, not taken.** In Stripe → Payments, the intent
+  should read _Uncaptured_. The poster's card shows a pending authorisation, not
+  a charge. This is the distinction the whole phase turns on.
+
+```sql
+select status, amount_cents, authorized_at, released_at
+from public.payments order by created_at desc limit 1;
+```
+
+Expect `authorized`, with `authorized_at` set and `released_at` null.
+
+**C. Release on completion.** As the poster: **My jobs** → **Mark complete &
+pay**.
+
+- Badge becomes **Released to worker**; the job becomes **Completed**.
+- In Stripe: the payment is now _Captured_, and Connect → the worker's account
+  shows a transfer for the full amount.
+
+```sql
+select status, released_at from public.payments order by created_at desc limit 1;
+```
+
+Expect `released` with `released_at` set. **Check the ordering held:** there
+should be no window where the job reads completed while the payment is still
+`captured` — the job is only marked complete after the transfer lands.
+
+**D. Declined card.** New job, new offer, accept with `4000 0000 0000 0002`.
+
+- Expect Stripe's own decline message inline, not a crash.
+- The payment row should be `failed` or still `requires_payment_method`.
+- **Tap Accept & pay again with a good card.** It must recover — the Edge
+  Function reuses the existing PaymentIntent rather than creating a second hold.
+  Check Stripe shows **one** intent for that offer, not two.
+
+**E. Card requiring authentication.** Accept with `4000 0025 0000 3155`. Stripe
+shows a 3D Secure challenge; complete it. The payment should end `authorized`
+exactly as in B. Then **cancel** the challenge on another attempt and confirm the
+app reports it cleanly and leaves no extra hold.
+
+**F. Double-tap — no double charge.** The spec's case, and the one worth being
+fussy about.
+
+- Tap **Accept & pay** twice in rapid succession on a pending offer.
+- Better: put the device in airplane mode after the first tap so the response is
+  lost, then retry.
+- **Expect exactly one PaymentIntent** in Stripe for that offer, and exactly one
+  row:
+
+```sql
+select offer_id, count(*) from public.payments group by offer_id having count(*) > 1;
+```
+
+Must return **no rows**. Any row here is a double-charge bug and payments should
+not ship.
+
+**G. A worker without completed onboarding cannot be paid.** Use a third account
+that has NOT done payout setup (`p6-outsider` works).
+
+- Have them offer on a job; accept and pay with a good card. The hold should
+  succeed — this is deliberate, so a poster is not blocked by the worker's
+  paperwork.
+- Then tap **Mark complete & pay**. Expect a refusal naming the reason, and
+  critically: **nothing captured.** In Stripe the intent must still read
+  _Uncaptured_, and the payment row still `authorized`.
+- Have that worker finish onboarding, then release again. It should now succeed.
+
+This is the test that proves the ordering in SECURITY.md §5: the payout check
+runs before the capture, so a worker who cannot be paid never leaves the payer
+charged with the money stuck on the platform.
+
+**H. Webhook signature.** Prove the endpoint rejects unsigned traffic:
+
+```sh
+curl -i -X POST https://aovsfxypbdoppezlyjus.supabase.co/functions/v1/stripe-webhook \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"payment_intent.succeeded","data":{"object":{"id":"pi_fake"}}}'
+```
+
+Expect **400 Invalid signature**. If this ever returns 200, anyone can mark any
+job paid — stop and fix it before doing anything else.
+
+Then replay a real event from Stripe → Webhooks → an event → **Resend**. Expect
+200 with `duplicate: true`, and no change to the payment row.
+
+---
+
+### Known gaps
+
+- **Nothing here has been run by me.** Every claim in this section is the
+  intended behaviour of code that has never executed.
+- **The Deno functions are untypechecked.** Run `deno check` before deploying.
+- **No automated test covers payments.** Phases 5 and 6 each ended with a
+  runnable suite; this one cannot have one until the functions are deployable.
+  Once they are, the double-charge case (F) and the not-onboarded case (G) are
+  the two worth automating first.
+- **Authorisations expire after ~7 days** and nothing detects it.
+- **No refund or cancellation path.** Cancelling a job after acceptance leaves a
+  hold that simply lapses.
+- **Apple Pay and Google Pay are not enabled**; they need a development build
+  and a merchant identifier. Card payments work in Expo Go.
+- **Fixture data and known-password accounts still present.** Still a release
+  blocker, and now the accounts have Stripe test accounts attached.
+
+
+---
+
+## 2026-09-21 — Phase 7 review fixes: what to re-test
+
+Ten of twelve review findings are fixed. **Four of them blocked the walkthrough
+below from ever passing**, so the phase 7 test plan should be run from the top
+rather than spot-checked — none of it has executed yet.
+
+### Before anything else
+
+The Stripe integration gained a function, so the deploy list has changed:
+
+```
+supabase functions deploy stripe-connect-onboarding --project-ref aovsfxypbdoppezlyjus
+supabase functions deploy stripe-connect-return --no-verify-jwt --project-ref aovsfxypbdoppezlyjus
+supabase functions deploy stripe-authorize-payment --project-ref aovsfxypbdoppezlyjus
+supabase functions deploy stripe-release-payment --project-ref aovsfxypbdoppezlyjus
+supabase functions deploy stripe-cancel-payment --project-ref aovsfxypbdoppezlyjus
+supabase functions deploy stripe-webhook --no-verify-jwt --project-ref aovsfxypbdoppezlyjus
+```
+
+`stripe-connect-return` **must** be deployed with `--no-verify-jwt`. Stripe
+redirects a browser to it and that browser has no Supabase session; with JWT
+verification on it returns 401 and onboarding dead-ends in the browser.
+
+Run `deno check supabase/functions/**/index.ts` first. The functions have never
+been typechecked and two of them are new.
+
+### A. Payouts onboarding now completes (was: 500 on every attempt)
+
+1. Sign in as a worker, open **Set up payouts**, tap **Set up payouts**.
+2. **Stripe's hosted form should open.** Before this fix the call failed with a
+   500 and the browser never opened — if you see that, check that
+   `stripe-connect-return` deployed and that `SUPABASE_URL` is set.
+3. Complete onboarding with Stripe's test values (`000-000-0000` for the phone,
+   `0000` for the SMS code, and the test bank routing `11000-000`).
+4. At the end, Stripe redirects to `.../functions/v1/stripe-connect-return`,
+   which bounces to `yoodle://payouts` and the app comes back to the front.
+5. Payout status should read **Ready**. If it reads **In review**, tap
+   **Refresh status** — `account.updated` may still be in flight.
+
+**Also test the abandon path:** start onboarding and close the browser without
+finishing. The app should return and show **Not set up** or **In review**, not
+an error, and tapping again should resume rather than create a second account.
+
+### B. A card can actually be entered (was: no card UI existed at all)
+
+This is the big one. Accepting an offer should now open **Stripe's PaymentSheet**.
+
+| Card | Expected |
+| --- | --- |
+| `4242 4242 4242 4242` | Succeeds. Payment badge becomes **Held**. |
+| `4000 0000 0000 0002` | Declined. Sheet shows Stripe's decline message. |
+| `4000 0025 0000 3155` | 3D Secure prompt, then succeeds once authenticated. |
+
+Any future expiry, any CVC, any postal code.
+
+Confirm for the successful card that **nothing has been charged**: in the Stripe
+dashboard the PaymentIntent is `requires_capture`, and the payment row is
+`authorized`. That is the held-not-charged state the whole design rests on.
+
+**Dismiss the sheet without paying.** This should be silent — no error banner —
+and the offer should show **Retry payment** (see D).
+
+### C. 3D Secure returns to the app
+
+Using `4000 0025 0000 3155`, complete the authentication. The app must come back
+to the front by itself. If it hangs in the browser, `returnURL` in
+`initPaymentSheet` (`yoodle://stripe-redirect`) does not match `scheme` in
+app.json or `urlScheme` on `StripeProvider`.
+
+### D. A failed payment is recoverable (was: unrecoverable)
+
+The Edge Function accepts the offer **before** the card is confirmed, so a
+decline leaves an accepted offer with no hold. Previously the action disappeared
+at that point and there was no way back.
+
+1. Accept an offer with the declining card `4000 0000 0000 0002`.
+2. The offer row should now show **Retry payment** and the line *"You accepted
+   this offer but the payment did not go through."*
+3. Tap **Retry payment** with `4242 4242 4242 4242`. It should succeed.
+4. Confirm in the Stripe dashboard that **only one PaymentIntent exists** for
+   that offer — the retry reuses it rather than creating a second hold.
+
+### E. Cancelling a job releases the hold (was: hold abandoned)
+
+1. Accept an offer and pay with `4242 4242 4242 4242`. Confirm **Held**.
+2. Cancel the job from My Jobs. The confirmation should mention the hold.
+3. In the Stripe dashboard the PaymentIntent must be **`canceled`**, and the
+   payment row `canceled`. Nothing charged.
+4. **Then try the refusal path:** on another job, mark complete (releasing the
+   payment), then attempt to cancel. It must refuse with *"already been paid
+   out"* and **must not** cancel the job.
+
+### F. Release still works, and now survives a missed webhook
+
+Run the original release walkthrough. Then test the reconciliation:
+
+1. Accept and pay so the hold exists, but **disable the webhook endpoint in the
+   Stripe dashboard first** so `amount_capturable_updated` never arrives.
+2. The payment row will still read `requires_payment_method` — the mirror never
+   caught up.
+3. Mark the job complete. **It should now succeed**, healing the row on the way.
+   Before this fix it refused, and the hold was stranded until expiry.
+4. Re-enable the webhook endpoint afterwards.
+
+### G. Error messages are the real ones (was: generic filler)
+
+Every Edge Function message was being replaced by generic text. Re-check that
+the specific copy now appears:
+
+- Release a payment to a worker who has **not** completed onboarding. Expect
+  *"This worker has not finished setting up payouts yet…"* — not *"Could not
+  release the payment. Please try again."*
+- Accept an offer on a job you then cancel from another device. Expect *"This
+  job has been cancelled, so it cannot be paid for."*
+
+If you see the generic wording, `readEdgeFailure` is not reading the response
+body and the rest of the error assertions here are meaningless.
+
+### H. Double-tap, again
+
+The original double-charge test still applies and is unchanged in intent: tap
+**Accept & pay** twice in rapid succession, and fire two concurrent `curl`s at
+`stripe-authorize-payment` with the same `offerId`. Exactly one PaymentIntent,
+exactly one payment row.
+
+Worth repeating now that the sheet exists: the second tap should find the sheet
+already open rather than starting a second authorisation.
+
+### I. A job with two payment rows
+
+The case that used to break the screen outright. Reaching it takes some setup:
+
+1. Accept offer A, let the card decline, leaving a `failed` row.
+2. Decline offer A and accept offer B instead, paying successfully.
+3. The job now has two payment rows. **Job detail must still show a payment
+   section** (previously it vanished), showing offer B's **Held**.
+4. **Mark complete must work** (previously: permanently *"There is no payment on
+   this job yet"*).
+
+### Known gaps
+
+- **Still nothing here has been run.** Every claim is intended behaviour of code
+  that has not executed. The fixes are read-correct and unverified.
+- **The Deno functions are still untypechecked.** No Deno toolchain available on
+  this machine.
+- **No automated test covers payments.** Cases D, E, F and I are now the ones
+  most worth automating — each is a silent, unrecoverable failure.
+- **My Jobs error banner** still prefers a stale release error over a fresh
+  cancel error (review finding 11, deliberately deferred). If an error looks
+  wrong during test E, this is why.
+- **Refunds and disputes remain unhandled**; cancellation voids a hold but
+  cannot undo a capture.
+- **Authorisations still expire after ~7 days** and nothing detects it.
+- **Fixture data and known-password accounts still present.** Still a release
+  blocker.

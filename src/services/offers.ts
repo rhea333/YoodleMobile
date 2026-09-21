@@ -254,7 +254,7 @@ export const loadOfferContext = async (
       ? supabase
           .from('profiles')
           .select(
-            'id, display_name, avatar_url, postal_fsa, bio, onboarded_at, created_at, updated_at',
+            'id, display_name, avatar_url, postal_fsa, bio, onboarded_at, stripe_payouts_enabled, stripe_details_submitted, created_at, updated_at',
           )
           .in('id', uniqueProfiles)
       : Promise.resolve({ data: [], error: null }),

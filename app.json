@@ -30,7 +30,15 @@
         {
           "locationWhenInUsePermission": "Yoodle uses your location to show odd jobs posted near you. Your position is rounded to about a kilometre before it is sent."
         }
-      ]
+      ],
+      [
+        "@stripe/stripe-react-native",
+        {
+          "merchantIdentifier": "",
+          "enableGooglePay": false
+        }
+      ],
+      "expo-web-browser"
     ]
   }
 }

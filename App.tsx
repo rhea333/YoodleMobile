@@ -1,5 +1,6 @@
 import './global.css';
 
+import { StripeProvider } from '@stripe/stripe-react-native';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
@@ -26,12 +27,29 @@ const queryClient = new QueryClient({
   },
 });
 
+/**
+ * The PUBLISHABLE key, and only ever the publishable key.
+ *
+ * It is designed to be public: it lets Stripe's SDK collect a card and confirm
+ * a PaymentIntent we hand it a client secret for. It cannot capture, transfer,
+ * refund or read anything. The SECRET key lives in Supabase Edge Function
+ * secrets and never enters this bundle — see SECURITY.md.
+ */
+const stripePublishableKey = process.env.EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY ?? '';
+
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <SafeAreaProvider>
-        <RootNavigator />
-      </SafeAreaProvider>
+      <StripeProvider
+        // Lets Stripe return to the app after a 3D Secure challenge, which is
+        // handled in a browser or bank app rather than in-process.
+        urlScheme="yoodle"
+        publishableKey={stripePublishableKey}
+      >
+        <SafeAreaProvider>
+          <RootNavigator />
+        </SafeAreaProvider>
+      </StripeProvider>
     </QueryClientProvider>
   );
 }

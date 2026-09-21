@@ -8,6 +8,7 @@ export { MakeOfferScreen } from './MakeOfferScreen';
 export { MyJobsScreen } from './MyJobsScreen';
 export { NotificationsScreen } from './NotificationsScreen';
 export { OffersScreen } from './OffersScreen';
+export { PayoutSetupScreen } from './PayoutSetupScreen';
 export { PostJobScreen } from './PostJobScreen';
 export { LogInScreen } from './LogInScreen';
 export { SignUpScreen } from './SignUpScreen';

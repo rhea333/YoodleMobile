@@ -51,9 +51,24 @@ export type ProfileRow = {
    * filled in: both are optional, so their absence cannot stand in for it.
    */
   onboarded_at: Timestamptz | null;
+  /**
+   * Whether Stripe will let this user receive transfers. Mirrored from Stripe
+   * by the `account.updated` webhook and re-checked server-side before any
+   * payout, so it is a hint for the UI, never the authority.
+   */
+  stripe_payouts_enabled: boolean;
+  stripe_details_submitted: boolean;
   created_at: Timestamptz;
   updated_at: Timestamptz;
 };
+
+/**
+ * NOTE ON WHAT IS ABSENT: `profiles.stripe_account_id` exists in the database
+ * but not here, on purpose and by the same rule as `jobs.location`. SELECT on
+ * it is revoked from every client role in migration 0017, so naming it in a
+ * query would fail the whole request. Keeping it out of `Row` means a component
+ * cannot ask for it in the first place.
+ */
 
 export type ProfileInsert = {
   id: Uuid;
@@ -222,6 +237,53 @@ export type JobCategoryCount = {
   job_count: number;
 };
 
+/**
+ * The lifecycle of a payment. Ordered as it happens:
+ *
+ *   requires_payment_method -> requires_action -> authorized -> captured -> released
+ *
+ * `authorized` is the one worth understanding: the card is HELD, nothing has
+ * been taken. `captured` means the payer has actually been charged. `released`
+ * means the money reached the worker's connected account — only
+ * stripe-release-payment sets that, because only it knows the transfer landed.
+ */
+export type PaymentStatus =
+  | 'requires_payment_method'
+  | 'requires_action'
+  | 'authorized'
+  | 'captured'
+  | 'released'
+  | 'failed'
+  | 'canceled';
+
+/**
+ * A payment as the CLIENT may see it.
+ *
+ * The Stripe object ids (`stripe_payment_intent_id`, `stripe_charge_id`,
+ * `stripe_transfer_id`) and `last_error` are columns on the table that are
+ * deliberately not granted to any client role, so they are absent here too.
+ * The app shows a status; Stripe's internal identifiers stay server-side.
+ *
+ * No Insert or Update type exists for this table, and that is not an omission:
+ * there is no client write path to payments at all. Every row is written by an
+ * Edge Function using the service role.
+ */
+export type PaymentRow = {
+  id: Uuid;
+  job_id: Uuid;
+  offer_id: Uuid;
+  payer_id: Uuid;
+  payee_id: Uuid;
+  /** Integer cents. Stripe's unit, stored rather than recomputed per read. */
+  amount_cents: number;
+  currency: string;
+  status: PaymentStatus;
+  authorized_at: Timestamptz | null;
+  released_at: Timestamptz | null;
+  created_at: Timestamptz;
+  updated_at: Timestamptz;
+};
+
 export type Database = {
   public: {
     Tables: {
@@ -247,6 +309,15 @@ export type Database = {
         Relationships: [];
       };
       reviews: { Row: ReviewRow; Insert: ReviewInsert; Update: ReviewUpdate; Relationships: [] };
+      // Read-only from the client. `Record<string, never>` rather than `never`
+      // for Insert/Update, for the reason spelled out on `messages`: `never`
+      // collapses EVERY table's write types, not just this one.
+      payments: {
+        Row: PaymentRow;
+        Insert: Record<string, never>;
+        Update: Record<string, never>;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {

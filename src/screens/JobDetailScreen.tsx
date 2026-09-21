@@ -3,9 +3,15 @@ import { ActivityIndicator, Image, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Avatar, Badge, Button, Card } from '../components';
-import { usePosterQuery, useJobQuery, useSession, useTheme } from '../hooks';
+import { usePaymentForJobQuery, usePosterQuery, useJobQuery, useSession, useTheme } from '../hooks';
 import type { MainStackParamList } from '../navigation/types';
-import { formatBudget, jobPhotoUrl } from '../services';
+import {
+  formatBudget,
+  formatMoney,
+  jobPhotoUrl,
+  paymentStatusHelp,
+  paymentStatusLabel,
+} from '../services';
 import { spacing } from '../theme';
 
 type Props = NativeStackScreenProps<MainStackParamList, 'JobDetail'>;
@@ -30,6 +36,9 @@ export const JobDetailScreen = ({ navigation, route }: Props) => {
 
   const jobQuery = useJobQuery(jobId);
   const posterQuery = usePosterQuery(jobQuery.data?.poster_id);
+  // Returns null for anyone who is not the payer or payee — RLS decides, so a
+  // browser looking at someone else's job simply sees no payment section.
+  const paymentQuery = usePaymentForJobQuery(jobId);
 
   if (jobQuery.isPending) {
     return (
@@ -92,6 +101,37 @@ export const JobDetailScreen = ({ navigation, route }: Props) => {
       <Text className="text-body text-text-secondary">
         {job.description ?? 'The poster did not add a description.'}
       </Text>
+
+      {paymentQuery.data ? (
+        <>
+          <Text className="mb-md mt-xl text-title font-semibold text-text-primary">Payment</Text>
+          <Card padding="sm" variant="filled">
+            <View className="flex-row flex-wrap items-center gap-xs">
+              <Badge
+                label={paymentStatusLabel(paymentQuery.data.status)}
+                tone={
+                  paymentQuery.data.status === 'released'
+                    ? 'success'
+                    : paymentQuery.data.status === 'authorized'
+                      ? 'info'
+                      : paymentQuery.data.status === 'failed' ||
+                          paymentQuery.data.status === 'canceled'
+                        ? 'danger'
+                        : 'warning'
+                }
+                withDot
+              />
+              <Badge
+                label={formatMoney(paymentQuery.data.amount_cents, paymentQuery.data.currency)}
+                tone="primary"
+              />
+            </View>
+            <Text className="mt-md text-footnote text-text-secondary">
+              {paymentStatusHelp(paymentQuery.data.status)}
+            </Text>
+          </Card>
+        </>
+      ) : null}
 
       <Text className="mb-md mt-xl text-title font-semibold text-text-primary">Posted by</Text>
       {posterQuery.isPending ? (

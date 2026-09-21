@@ -36,6 +36,8 @@ export type MainStackParamList = {
   Chat: { jobId: string; otherUserId: string; otherUserName: string };
   /** In-memory feed of what arrived since the app opened. */
   Notifications: undefined;
+  /** Stripe Connect onboarding, so a worker can be paid. */
+  PayoutSetup: undefined;
   /**
    * DEV ONLY. The component gallery kept from phase 1. `MainNavigator`
    * registers this route only when `__DEV__`, so navigating to it in a release

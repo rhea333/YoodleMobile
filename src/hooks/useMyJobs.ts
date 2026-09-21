@@ -1,6 +1,13 @@
 import { useMutation, useQuery, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 
-import { cancelJob, createJob, listMyJobs, updateJob, type CreateJobInput } from '../services';
+import {
+  cancelJob,
+  cancelPaymentForJob,
+  createJob,
+  listMyJobs,
+  updateJob,
+  type CreateJobInput,
+} from '../services';
 import type { JobRow, JobUpdate, Uuid } from '../types/database';
 import { jobKeys } from './useBrowseJobs';
 
@@ -87,11 +94,32 @@ export interface UseCancelJobOptions {
   onSuccess?: (job: JobRow) => void;
 }
 
+/**
+ * Cancel a job, and release any hold standing on the poster's card.
+ *
+ * THE HOLD COMES FIRST, AND THE ORDER IS THE POINT. A manual-capture
+ * PaymentIntent is a real authorisation: the poster's money is unavailable to
+ * them until it is cancelled or expires, which can take a week. Cancelling the
+ * job first and failing to lift the hold would leave the money stranded on a
+ * job that no longer exists, with nothing in the app able to reach it.
+ *
+ * Failing the other way round is recoverable: the hold is lifted and the job is
+ * still live, so the poster can cancel again, or re-accept the offer and pay
+ * from the Offers screen.
+ *
+ * A job with no payment is not a special case — the Edge Function succeeds
+ * with nothing to do, and the cancel proceeds.
+ */
 export const useCancelJobMutation = (options?: UseCancelJobOptions) => {
   const queryClient = useQueryClient();
 
   return useMutation<JobRow, Error, Uuid>({
     mutationFn: async (jobId) => {
+      const released = await cancelPaymentForJob(jobId);
+      if (!released.ok) {
+        throw new Error(released.message);
+      }
+
       const result = await cancelJob(jobId);
       if (!result.ok) {
         throw new Error(result.message);
@@ -101,6 +129,8 @@ export const useCancelJobMutation = (options?: UseCancelJobOptions) => {
     onSuccess: (job) => {
       queryClient.setQueryData(jobKeys.detail(job.id), job);
       void queryClient.invalidateQueries({ queryKey: jobKeys.all });
+      // The hold is gone, so every payment view is stale.
+      void queryClient.invalidateQueries({ queryKey: ['payments'] });
       options?.onSuccess?.(job);
     },
   });

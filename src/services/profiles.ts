@@ -12,8 +12,10 @@ import { supabase } from './supabase';
  */
 
 /** Columns a client is actually permitted to read. Keep in sync with 0008. */
+// One string literal, not a concatenation: supabase-js infers the row type
+// from this at compile time, and a runtime concat gives it nothing to read.
 const PROFILE_COLUMNS =
-  'id, display_name, avatar_url, postal_fsa, bio, onboarded_at, created_at, updated_at';
+  'id, display_name, avatar_url, postal_fsa, bio, onboarded_at, stripe_payouts_enabled, stripe_details_submitted, created_at, updated_at';
 
 export const AVATAR_BUCKET = 'avatars';
 

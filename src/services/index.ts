@@ -46,6 +46,30 @@ export {
   sanitizeJobTitle,
 } from './sanitize';
 export {
+  authorizePaymentForOffer,
+  cancelPaymentForJob,
+  formatMoney,
+  getMyPayoutStatus,
+  getPaymentForJob,
+  listMyPayments,
+  paymentStatusHelp,
+  paymentStatusLabel,
+  pickLivePayment,
+  releasePaymentForJob,
+  startPayoutOnboarding,
+} from './payments';
+export type {
+  AuthorizedPayment,
+  AuthorizeResult,
+  CancelPaymentResult,
+  PaymentResult,
+  PaymentsResult,
+  PaymentStatus,
+  PayoutStatus,
+  PayoutStatusResult,
+  ReleaseResult,
+} from './payments';
+export {
   acceptOffer,
   declineOffer,
   listMyOffers,

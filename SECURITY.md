@@ -1576,3 +1576,434 @@ than the finding simply being verified once and written up.
 
 Block and report remain unbuilt, and remain the launch blocker described in the
 phase 6 entry. Nothing here touches that.
+
+---
+
+## 2026-09-20 — Phase 7: payments
+
+The most detailed entry in this file, deliberately. Everything else here
+protects data; this protects money, and it is the part a handoff engineer is
+most likely to change without understanding why it is shaped this way.
+
+**Status: WRITTEN BUT NOT DEPLOYED OR EXERCISED.** See "What is not verified"
+at the end before trusting any of it.
+
+---
+
+### 1. The trust boundary, in one picture
+
+```
+  APP (untrusted — anyone can read the bundle and tamper with the client)
+    - EXPO_PUBLIC_STRIPE_PUBLISHABLE_KEY   pk_test_...
+    - Stripe SDK collects the card
+    - calls Edge Functions with the user's JWT
+    - READS payments.status. Writes NOTHING.
+                    |
+                    | supabase.functions.invoke (JWT verified by the platform)
+                    v
+  EDGE FUNCTIONS (trusted — Supabase servers, never shipped to a device)
+    - STRIPE_SECRET_KEY      sk_test_...   full control of the Stripe account
+    - STRIPE_WEBHOOK_SECRET  whsec_...     proves an event came from Stripe
+    - SUPABASE_SERVICE_ROLE_KEY            bypasses RLS
+    - the ONLY writer of payment state
+                    |
+                    v
+  STRIPE  <--- webhook (signature-verified) ---
+```
+
+The single rule that everything else follows from: **the app can ask for money
+to move, and can observe that it moved, but cannot assert that it moved.**
+
+---
+
+### 2. Webhook signature verification
+
+`supabase/functions/stripe-webhook/index.ts` is deployed with
+`verify_jwt = false`. It has to be: Stripe calls it and Stripe has no Supabase
+credentials. **That means anyone on the internet can POST to this URL.**
+
+The only thing separating a real Stripe event from a forged one is the
+`stripe-signature` header — an HMAC Stripe computes over the raw request body
+with the shared `whsec_` secret. Every request is verified with
+`constructEventAsync` before a single row is read or written.
+
+**What happens without it:** this, from any laptop, marks a job paid —
+
+```
+POST /functions/v1/stripe-webhook
+{"type":"payment_intent.succeeded","data":{"object":{"id":"pi_..."}}}
+```
+
+— and with the release path keyed off payment state, that is a free job. The
+check is not a formality; it is the whole authentication mechanism for this
+endpoint.
+
+**Three implementation details that silently break it:**
+
+1. **The signature covers the RAW bytes.** `await req.text()` must come before
+   any parsing. Reading the body as JSON and re-serialising changes whitespace
+   and key order, and every signature then fails. The handler reads raw text
+   first and hands that exact string to the verifier.
+2. **Deno's crypto is async.** `constructEvent` (sync) throws in this runtime;
+   `constructEventAsync` with `Stripe.createSubtleCryptoProvider()` is required.
+   A handler that "works locally on Node" will fail here.
+3. **It fails CLOSED.** If `STRIPE_WEBHOOK_SECRET` is unset the function returns
+   500 and processes nothing. An unverifiable webhook is worth less than no
+   webhook, because it looks like it is working.
+
+**Replay protection** is separate from signature checking and equally
+necessary. Stripe retries until it gets a 2xx and can deliver the same event
+more than once. Every event id is INSERTed into `stripe_events` before handling;
+a primary-key collision (23505) means "already processed" and returns 200
+immediately. Inserting first makes this a lock rather than a check — two
+concurrent deliveries of one event cannot both pass a "have I seen this?" test,
+because one of them loses the insert.
+
+If a handler throws after that insert, the event row is deleted before
+returning 500, so Stripe's retry does real work instead of being swallowed as a
+duplicate.
+
+---
+
+### 3. Idempotency: why a double tap cannot double charge
+
+The spec asked for Stripe idempotency keys. There are three independent layers,
+because any one of them can be defeated by a change that looks harmless.
+
+**Layer 1 — the database.** `payments.offer_id` is `UNIQUE`
+(`payments_one_per_offer`). Two payment rows for one offer are not
+representable. There is also a partial unique index on
+`stripe_payment_intent_id`, so one PaymentIntent cannot be attached to two rows.
+
+**Layer 2 — reuse before create.** `stripe-authorize-payment` looks for an
+existing payment on the offer and, if it finds one, retrieves and returns that
+PaymentIntent rather than making another. It also refuses if the offer amount
+has changed underneath it, instead of quietly charging the old figure.
+
+**Layer 3 — Stripe idempotency keys**, derived from stable ids, never from a
+timestamp or a random value:
+
+| Operation              | Key                        |
+| ---------------------- | -------------------------- |
+| create Connect account | `connect-account:{userId}` |
+| create PaymentIntent   | `authorize:{offerId}`      |
+| capture                | `capture:{paymentId}`      |
+| transfer               | `transfer:{paymentId}`     |
+
+A retried request with the same key returns the ORIGINAL object. This is what
+protects against the case the other two layers cannot see: a request that timed
+out client-side but actually succeeded at Stripe.
+
+**The race that layers 1 and 3 alone would miss.** Two simultaneous taps can
+both pass the "does a payment exist?" read before either inserts. Both then
+create a PaymentIntent — with the same idempotency key, so Stripe returns the
+same intent to both — and both try to insert. One insert wins; the loser
+**cancels the intent it created and returns the winner's**. Without that
+cancel, a rejected insert would leave an orphaned hold on the payer's card.
+
+---
+
+### 4. PCI scope: raw card data never reaches us
+
+**No screen in this app has a card number field, and that is not an oversight.**
+
+The card is collected by **PaymentSheet** from `@stripe/stripe-react-native` —
+`initPaymentSheet` then `presentPaymentSheet`, in `useAcceptAndPayMutation`.
+That is Stripe's own native UI, rendered by Stripe's SDK, posting directly to
+Stripe. What Yoodle handles is:
+
+- a `client_secret` (a scoped, short-lived handle to one PaymentIntent), and
+- afterwards, a status string.
+
+It never sees a PAN, CVC, expiry or cardholder name. Nothing card-related is
+logged, stored or forwarded. This keeps the project in the lightest PCI category
+(SAQ A) — the one where a merchant fully outsources card handling — and it is
+worth stating that this is a property of the architecture, not of a policy. The
+moment somebody adds a `TextInput` for a card number "just for testing", the
+scope changes and the audit obligations change with it.
+
+Bank details are the same story: Connect **Express** onboarding is hosted by
+Stripe. Legal name, date of birth, address, SIN and bank account go to Stripe's
+page, not ours. `profiles.stripe_account_id` is the only trace, and no client
+role can read it.
+
+---
+
+### 5. The ORDER money moves in
+
+`stripe-release-payment` does three things, and the order is the point:
+
+```
+1. check the worker can actually be paid out   <-- BEFORE anything irreversible
+2. capture   (money leaves the payer's card)
+3. transfer  (money reaches the worker)
+```
+
+The naive ordering — capture, then try to transfer — produces the worst
+available failure: the payer is charged, the worker is unpaid, and the money
+sits in the platform balance with no automatic way out. It is also the ordering
+you get by accident if you treat "mark complete" as a status change with a
+payment side effect.
+
+So the payout check comes first, and it is done **twice**: against the mirrored
+`stripe_payouts_enabled` flag, and then against Stripe directly, because the
+mirror is only as fresh as the last `account.updated` webhook. If either says
+no, **nothing is captured** — the hold stays in place, the payer is not charged,
+and the release can be retried once the worker finishes onboarding.
+
+`source_transaction` on the transfer ties it to the specific charge, which lets
+it succeed before funds settle into the platform balance. Without it a new
+platform account has no available balance and every transfer fails
+`balance_insufficient` — a failure that looks like a code bug and is not.
+
+The job is marked `completed` **last**, after the transfer lands. A completed
+job with an unpaid worker would be a worse lie than an incomplete job with a
+paid one.
+
+---
+
+### 6. Authorisation: who may move whose money
+
+Platform `verify_jwt` proves the caller holds a valid session. It does not say
+**whose**. Every function re-derives the user from the token and checks the
+relationship itself:
+
+| Function                    | Check                                                                              |
+| --------------------------- | ---------------------------------------------------------------------------------- |
+| `stripe-connect-onboarding` | acts only on the caller's own account; no parameter names another user             |
+| `stripe-authorize-payment`  | caller must be `jobs.poster_id` for the offer's job; cannot accept their own offer |
+| `stripe-release-payment`    | caller must be `jobs.poster_id` for the job                                        |
+
+A valid session for the wrong user gets 403, not a payment.
+
+---
+
+### 7. What a client can touch
+
+From migration 0017:
+
+| Object                                                                                         | Client SELECT                                                                  | Client write |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | ------------ |
+| `payments` (id, job, offer, payer, payee, amount, currency, status, timestamps)                | payer or payee only, via RLS                                                   | **none**     |
+| `payments.stripe_payment_intent_id` / `stripe_charge_id` / `stripe_transfer_id` / `last_error` | **no**                                                                         | none         |
+| `profiles.stripe_payouts_enabled` / `stripe_details_submitted`                                 | yes                                                                            | **none**     |
+| `profiles.stripe_account_id`                                                                   | **no** (verified: `has_column_privilege` false for `anon` and `authenticated`) | none         |
+| `stripe_events`                                                                                | **no**                                                                         | none         |
+
+`payments` has a SELECT policy and no INSERT, UPDATE or DELETE policy at all.
+Edge Functions write it with the service role, which bypasses RLS. So "paid"
+means Stripe said so, not that a client claimed it.
+
+Stripe's internal ids are withheld from clients on the principle that an
+attacker probing an API is meaningfully helped by knowing real object ids.
+`last_error` is withheld because it can carry account state that belongs in logs.
+
+---
+
+### 8. Key handling, and one key that needs rotating
+
+| Key                         | Lives                          | Reaches the app? |
+| --------------------------- | ------------------------------ | ---------------- |
+| `pk_test_...` publishable   | `.env` → app bundle            | yes, by design   |
+| `sk_test_...` secret        | Supabase Edge Function secrets | **never**        |
+| `whsec_...` webhook         | Supabase Edge Function secrets | **never**        |
+| `SUPABASE_SERVICE_ROLE_KEY` | injected by the platform       | **never**        |
+
+`.env` and `supabase/functions/.env` are both gitignored (`.gitignore:34`,
+verified with `git check-ignore` for both paths).
+
+**ACTION REQUIRED — rotate the Stripe secret key.** It was pasted into a chat
+transcript to reach me. It is a TEST-mode key, so it cannot move real money, but
+it can create and read test data on the account and it now exists in at least
+one place it should not. Roll it in the Stripe dashboard once this phase is
+working, and set the new value as an Edge Function secret. The same applies, as
+it has since phase 2, to the Supabase MCP PAT.
+
+---
+
+### 9. What is NOT verified
+
+Stated plainly because this is the file where over-claiming does the most harm.
+
+**Nothing in this phase has been run.** The account's Supabase role returns 403
+on the Management API endpoints for Edge Functions and secrets — the same
+limitation that has blocked `get_advisors` since phase 2 — so:
+
+- the three functions and the webhook handler are **written and committed but
+  never deployed**;
+- `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` are **not set**;
+- no PaymentIntent, capture, transfer or webhook has ever executed;
+- the Deno code has not been typechecked (`deno` is not installed locally, and
+  `supabase/functions` is excluded from the app's `tsc` because its globals and
+  module specifiers are a different runtime).
+
+What HAS been verified is the database half: the migration is applied, and the
+grants were checked directly — `payments` exposes SELECT only, the four Stripe
+id columns are ungranted, and `stripe_account_id` is unreadable by both client
+roles.
+
+Treat every claim in sections 2 through 6 as **a description of the code's
+intent, confirmed by reading it, not by running it**, until the walkthrough in
+TESTING.md has been completed.
+
+---
+
+### 10. Outstanding
+
+- **Deploy and exercise everything.** Until then this phase is untested code on
+  the money path.
+- **Rotate the Stripe secret key** (above) and the Supabase PAT.
+- **No platform fee is taken.** The transfer is the full offer amount. If Yoodle
+  ever takes a cut, that is an `application_fee_amount` change and a tax
+  question, not just a number.
+- **Authorisations expire after about 7 days.** A job accepted and not completed
+  within a week will have its hold lapse, and nothing currently detects that or
+  asks the poster to re-authorise.
+- **No refund or dispute path.** A cancelled job after acceptance leaves a hold
+  that is never explicitly voided; it simply expires. Disputes are unhandled.
+- **`get_advisors` still unavailable**, now across five phases and a payments
+  schema.
+- **Block and report still unbuilt** — the phase 6 launch blocker is unchanged,
+  and money raises the stakes rather than lowering them.
+
+
+---
+
+## 2026-09-21 — Phase 7 review fixes: the payment path could not complete
+
+A code review of the phase 7 payments work found twelve issues. Ten are fixed
+here. The four that mattered most had the same shape: **code that read as
+correct and had never been run**, which is exactly the risk section 9 warned
+about and then did not act on.
+
+### The one that invalidated the PCI claim
+
+`useAcceptAndPayMutation` called `confirmPayment(clientSecret, {
+paymentMethodType: 'Card' })` with no payment-method data, and **no `CardField`,
+`CardForm` or PaymentSheet existed anywhere in the app**. The React Native SDK
+reads card details from a mounted `CardField`; with none mounted, confirmation
+could never succeed. Every payment would have failed at the last step.
+
+Section 4 of the phase 7 entry described `confirmPayment` as "Stripe's own
+native UI". That was not true of the code as written — `confirmPayment` renders
+nothing. The claim has been corrected in place, and the code now does what the
+claim says: `initPaymentSheet` + `presentPaymentSheet`, which IS Stripe's own
+native sheet.
+
+**The PCI position is unchanged and now actually holds.** The card is collected
+by Stripe's sheet, in Stripe's SDK, posted directly to Stripe. Yoodle still sees
+only a `client_secret` and a status. The point worth keeping: *the architecture
+was right and the implementation did not exist*, and nothing in the repository
+distinguished the two until someone looked.
+
+### Onboarding could never start
+
+`accountLinks.create` was given `yoodle://payouts` for `refresh_url` and
+`return_url`. **Stripe rejects a custom scheme** — those fields must be http(s)
+— so every onboarding attempt would have failed with a 500.
+
+Fixed by adding `stripe-connect-return`, an https function whose only job is to
+302 the browser back to `yoodle://payouts`, which is what
+`WebBrowser.openAuthSessionAsync` is waiting for.
+
+**It is deliberately not an open redirect.** The destination is a constant in
+the file. The query string can select between two fixed suffixes and nothing
+more; no part of the request ever becomes part of the target URL. A redirector
+that echoed a caller-supplied `url` would be a phishing primitive hosted on our
+own Supabase domain, and it would be trusted precisely because it is ours.
+
+It is deployed with `--no-verify-jwt`, for the same reason as the webhook:
+Stripe redirects a browser here and that browser carries no Supabase session.
+Unlike the webhook, there is nothing to verify — it reads no data, writes no
+data, holds no secret, and no onboarding state is ever taken from the redirect.
+Onboarding status is still read back from Stripe.
+
+### Authorisation gaps closed
+
+- **A hold could be placed on a cancelled job.** `stripe-authorize-payment`
+  selected `job.status` and never read it, and cancelling a job does not settle
+  the offers sitting on it. A poster could cancel, then accept a still-`pending`
+  offer, putting a real hold on a card for work nobody expected to happen.
+  `cancelled` and `completed` are now refused.
+- **A cancelled job could be marked complete.** `stripe-release-payment` had the
+  same gap in reverse — it would have captured the card and flipped the job back
+  to `completed`. Now refused.
+- **A card could be charged for an offer that was never accepted.** The
+  `offers` status update after a successful PaymentIntent discarded its error.
+  If it failed, the poster got a working client secret for an offer still
+  showing as `pending` to the worker. The error is now checked, the intent
+  cancelled, and the request failed.
+
+### Stripe is the authority, not `payments.status`
+
+Release was gated on the mirrored `payments.status === 'authorized'`, which only
+the webhook writes. **One dropped or delayed `amount_capturable_updated` would
+strand a real hold until it expired** — the payer's money tied up, the worker
+owed, and nothing in the app able to move it.
+
+The function now retrieves the PaymentIntent and decides from that, healing the
+mirror as it goes. The security property is unchanged and worth restating: the
+*client* still cannot write payment state, and the app is still not trusted for
+anything. What changed is which **server-side** source is treated as
+authoritative — Stripe, rather than our cache of Stripe.
+
+### Holds are now released when a job is cancelled
+
+Previously listed under "Outstanding" as a known gap; it was worse than it
+looked. A manual-capture PaymentIntent is a **real authorisation on a real
+card**: the money is not taken, but it is unavailable to the poster until it
+expires, up to about a week. Cancelling a job left that standing with nothing in
+the app able to lift it.
+
+`stripe-cancel-payment` now voids the hold, and `useCancelJobMutation` calls it
+**before** cancelling the job. The order is the point: fail after the hold is
+lifted and the job is merely still live (the poster can cancel again); fail the
+other way round and the money is stranded on a job that no longer exists.
+
+It refuses `captured` and `released` payments rather than pretending. Reversing
+those is a refund plus a transfer reversal — a different decision, with a
+dispute behind it, and not something a "cancel job" button should perform.
+
+### Two rows, one job
+
+`payments_one_per_offer` is unique on `offer_id`, **not `job_id`**. Both the app
+and `stripe-release-payment` looked up payments with `.maybeSingle()` keyed on
+`job_id`, which throws the moment a job has a second payment row — a job whose
+first offer failed and was replaced. The failure mode was silent in the app (the
+payment section vanished) and permanent on the server ("There is no payment on
+this job yet"). In other words it broke **exactly the jobs that had already had
+trouble**.
+
+A shared `pickLivePayment` rule now decides: furthest along wins, ties break to
+most recent. It is deliberately duplicated in `_shared/stripe.ts` and
+`src/services/payments.ts` rather than shared across the Deno/RN boundary — if
+those two ever disagree, the app shows a row the server refuses to act on.
+
+### Edge Function messages now reach the user
+
+`functions.invoke` resolves with `data: null` for **any** non-2xx, so every
+`data.error` read was `undefined`. Every deliberately-worded message and every
+machine-readable `code` — including `payee_not_onboarded` — was being replaced
+by generic filler. The body is now read off `FunctionsHttpError.context`.
+
+No new disclosure: the Edge Functions already pass user-facing copy through
+`describeStripeError`, which keeps Stripe's internal ids and account state in
+`payments.last_error` (unreadable by any client role) rather than on a phone
+screen. This change surfaces the messages that were always intended to be seen.
+
+### Still outstanding
+
+- **Still not deployed, still not exercised.** These fixes are read-correct and
+  unrun. The walkthrough in TESTING.md remains the gate.
+- **The Deno functions are still untypechecked** — no Deno toolchain on this
+  machine. Run `deno check` before deploying; `stripe-cancel-payment` and the
+  reconciliation branch in `stripe-release-payment` are new and unverified.
+- **Banner precedence on My Jobs** (review finding 11) is deliberately deferred:
+  a retained release error outranks a fresh cancel error. Cosmetic, no money
+  consequence.
+- **Refunds and disputes remain unhandled.** Cancellation now voids a hold; it
+  cannot undo a capture.
+- **Authorisations still expire after ~7 days** and nothing detects it.
+- **Rotate the Stripe secret key** and the Supabase PAT.
+- **`get_advisors` still unavailable.**
+- **Block and report still unbuilt** — unchanged since phase 6.

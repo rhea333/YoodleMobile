@@ -199,6 +199,12 @@ export const HomeScreen = ({ navigation }: Props) => {
             is untouched. */}
         <View className="flex-row items-center gap-xs">
           <Button
+            label="Payouts"
+            onPress={() => navigation.navigate('PayoutSetup')}
+            size="sm"
+            variant="ghost"
+          />
+          <Button
             label="Offers"
             onPress={() => navigation.navigate('Offers')}
             size="sm"

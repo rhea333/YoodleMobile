@@ -4,9 +4,16 @@ import { ActivityIndicator, FlatList, RefreshControl, Text, View } from 'react-n
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Badge, Button, Card } from '../components';
-import { useCancelJobMutation, useMyJobsQuery, useSession, useTheme } from '../hooks';
+import {
+  useCancelJobMutation,
+  useMyJobsQuery,
+  useMyPaymentsQuery,
+  useReleasePaymentMutation,
+  useSession,
+  useTheme,
+} from '../hooks';
 import type { MainStackParamList } from '../navigation/types';
-import { formatBudget, jobStatusLabel } from '../services';
+import { formatBudget, jobStatusLabel, paymentStatusLabel } from '../services';
 import { spacing } from '../theme';
 import type { JobRow, JobStatus } from '../types/database';
 
@@ -46,10 +53,22 @@ export const MyJobsScreen = ({ navigation }: Props) => {
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const cancelJob = useCancelJobMutation({ onSuccess: () => setConfirmingId(null) });
 
+  const payments = useMyPaymentsQuery(Boolean(userId));
+
+  // "Mark complete" is not a status change with a payment side effect — it IS
+  // the release. The Edge Function captures the hold and transfers to the
+  // worker, and only marks the job completed once the transfer has landed.
+  const [releasingId, setReleasingId] = useState<string | null>(null);
+  const releasePayment = useReleasePaymentMutation({ onSuccess: () => setReleasingId(null) });
+
   const renderJob = ({ item }: { item: JobRow }) => {
     const budget = formatBudget(item.budget);
     const isConfirming = confirmingId === item.id;
     const isCancelled = item.status === 'cancelled';
+    const payment = payments.data?.[item.id];
+    // Only an authorised hold can be released. Before that there is nothing to
+    // capture; after it, the money has already gone.
+    const canComplete = payment?.status === 'authorized';
 
     return (
       <Card title={item.title} variant="outlined">
@@ -63,6 +82,20 @@ export const MyJobsScreen = ({ navigation }: Props) => {
               tone="info"
             />
           ) : null}
+          {payment ? (
+            <Badge
+              label={paymentStatusLabel(payment.status)}
+              tone={
+                payment.status === 'released'
+                  ? 'success'
+                  : payment.status === 'authorized'
+                    ? 'info'
+                    : payment.status === 'failed' || payment.status === 'canceled'
+                      ? 'danger'
+                      : 'warning'
+              }
+            />
+          ) : null}
         </View>
 
         {isConfirming ? (
@@ -70,6 +103,9 @@ export const MyJobsScreen = ({ navigation }: Props) => {
             <Text className="mb-sm text-footnote text-text-secondary">
               Cancel this job? It stops appearing in Browse. Nothing is deleted, and you will still
               see it here.
+              {payment && !isCancelled
+                ? ' Any hold on your card for this job is released, so nothing is charged.'
+                : ''}
             </Text>
             <View className="flex-row gap-sm">
               <Button
@@ -95,6 +131,17 @@ export const MyJobsScreen = ({ navigation }: Props) => {
               size="sm"
               variant="secondary"
             />
+            {canComplete ? (
+              <Button
+                label="Mark complete & pay"
+                loading={releasePayment.isPending && releasingId === item.id}
+                onPress={() => {
+                  setReleasingId(item.id);
+                  releasePayment.mutate(item.id);
+                }}
+                size="sm"
+              />
+            ) : null}
             {!isCancelled ? (
               <>
                 <Button
@@ -138,10 +185,12 @@ export const MyJobsScreen = ({ navigation }: Props) => {
 
   return (
     <View className="flex-1 bg-background" style={{ paddingHorizontal: spacing.lg }}>
-      {cancelJob.error ? (
+      {(cancelJob.error ?? releasePayment.error) ? (
         <View className="mt-md">
           <Card padding="sm" variant="filled">
-            <Text className="text-footnote text-danger">{cancelJob.error.message}</Text>
+            <Text className="text-footnote text-danger">
+              {releasePayment.error?.message ?? cancelJob.error?.message}
+            </Text>
           </Card>
         </View>
       ) : null}

@@ -5,7 +5,9 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Badge, Button, Card } from '../components';
 import {
+  useAcceptAndPayMutation,
   useMyOffersQuery,
+  useMyPaymentsQuery,
   useOfferActionMutation,
   useOfferContextQuery,
   useOffersOnMyJobsQuery,
@@ -13,11 +15,20 @@ import {
   useTheme,
 } from '../hooks';
 import type { MainStackParamList } from '../navigation/types';
-import { formatBudget, offerStatusLabel } from '../services';
+import { formatBudget, offerStatusLabel, paymentStatusLabel } from '../services';
 import { spacing } from '../theme';
 import type { OfferRow, OfferStatus } from '../types/database';
 
 type Props = NativeStackScreenProps<MainStackParamList, 'Offers'>;
+
+/**
+ * Statuses where the hold exists and there is nothing left to pay.
+ *
+ * Anything else on an ACCEPTED offer means the poster still owes a card — the
+ * Edge Function accepts the offer before Stripe's sheet confirms, so a decline,
+ * a dismissed sheet or a dead connection all land here.
+ */
+const SECURED_PAYMENT_STATUSES = ['authorized', 'captured', 'released'];
 
 const statusTone = (status: OfferStatus): 'success' | 'neutral' | 'warning' | 'danger' => {
   switch (status) {
@@ -62,15 +73,58 @@ export const OffersScreen = ({ navigation }: Props) => {
   const [pendingId, setPendingId] = useState<string | null>(null);
   const offerAction = useOfferActionMutation({ onSuccess: () => setPendingId(null) });
 
+  // One read for the whole screen, indexed by job id. A payment is only ever
+  // visible to its payer and payee, so this is already scoped by RLS.
+  const payments = useMyPaymentsQuery(Boolean(userId));
+
+  // Accepting IS paying: the Edge Function accepts the offer and places a hold
+  // on the poster's card in one call, then Stripe's sheet collects the card.
+  // Doing them separately would leave an accepted offer with no payment
+  // attached if the poster closed the app in between.
+  const acceptAndPay = useAcceptAndPayMutation({ onSuccess: () => setPendingId(null) });
+
   const loading = received.isPending || sent.isPending;
-  const error = received.error ?? sent.error ?? offerAction.error;
+  const error = received.error ?? sent.error ?? offerAction.error ?? acceptAndPay.error;
 
   const jobTitle = (jobId: string) => context.data?.jobsById[jobId]?.title ?? 'A job';
+
+  /** The payment badge for a job, or nothing if no payment has started. */
+  const paymentBadge = (jobId: string) => {
+    const payment = payments.data?.[jobId];
+    if (!payment) return null;
+    return (
+      <Badge
+        label={paymentStatusLabel(payment.status)}
+        tone={
+          payment.status === 'released'
+            ? 'success'
+            : payment.status === 'authorized'
+              ? 'info'
+              : payment.status === 'failed' || payment.status === 'canceled'
+                ? 'danger'
+                : 'warning'
+        }
+      />
+    );
+  };
   const workerName = (workerId: string) =>
     context.data?.profilesById[workerId]?.display_name ?? 'A neighbour';
 
   const renderReceived = (offer: OfferRow) => {
     const busy = offerAction.isPending && pendingId === offer.id;
+
+    // The payment indexed for this job only counts as THIS offer's payment if
+    // it was created for it; a job can carry a row from an earlier offer.
+    const jobPayment = payments.data?.[offer.job_id];
+    const ownPayment = jobPayment?.offer_id === offer.id ? jobPayment : null;
+    const secured = ownPayment ? SECURED_PAYMENT_STATUSES.includes(ownPayment.status) : false;
+
+    // Accepting and paying are one call, but only the first half is guaranteed
+    // to have happened. An accepted offer with no secured hold still needs a
+    // card, so the action STAYS VISIBLE — without this there is no way back
+    // from a declined card, and the job is stranded with an unpaid worker.
+    const needsPayment = offer.status === 'accepted' && !secured;
+    const canPay = offer.status === 'pending' || needsPayment;
 
     return (
       <Card
@@ -82,10 +136,18 @@ export const OffersScreen = ({ navigation }: Props) => {
         <View className="flex-row flex-wrap items-center gap-xs">
           <Badge label={offerStatusLabel(offer.status)} tone={statusTone(offer.status)} withDot />
           <Badge label={formatBudget(offer.amount) ?? '—'} tone="primary" />
+          {paymentBadge(offer.job_id)}
         </View>
 
         {offer.message ? (
           <Text className="mt-md text-body text-text-secondary">{offer.message}</Text>
+        ) : null}
+
+        {needsPayment ? (
+          <Text className="mt-md text-footnote text-danger">
+            You accepted this offer but the payment did not go through. The worker is not paid until
+            it does.
+          </Text>
         ) : null}
 
         <View className="mt-md flex-row flex-wrap gap-sm">
@@ -101,27 +163,27 @@ export const OffersScreen = ({ navigation }: Props) => {
             size="sm"
             variant="secondary"
           />
+          {canPay ? (
+            <Button
+              label={needsPayment ? 'Retry payment' : 'Accept & pay'}
+              loading={busy || (acceptAndPay.isPending && pendingId === offer.id)}
+              onPress={() => {
+                setPendingId(offer.id);
+                acceptAndPay.mutate({ offerId: offer.id });
+              }}
+              size="sm"
+            />
+          ) : null}
           {offer.status === 'pending' ? (
-            <>
-              <Button
-                label="Accept"
-                loading={busy}
-                onPress={() => {
-                  setPendingId(offer.id);
-                  offerAction.mutate({ offerId: offer.id, action: 'accept' });
-                }}
-                size="sm"
-              />
-              <Button
-                label="Decline"
-                onPress={() => {
-                  setPendingId(offer.id);
-                  offerAction.mutate({ offerId: offer.id, action: 'decline' });
-                }}
-                size="sm"
-                variant="ghost"
-              />
-            </>
+            <Button
+              label="Decline"
+              onPress={() => {
+                setPendingId(offer.id);
+                offerAction.mutate({ offerId: offer.id, action: 'decline' });
+              }}
+              size="sm"
+              variant="ghost"
+            />
           ) : null}
         </View>
       </Card>
@@ -137,6 +199,7 @@ export const OffersScreen = ({ navigation }: Props) => {
         <View className="flex-row flex-wrap items-center gap-xs">
           <Badge label={offerStatusLabel(offer.status)} tone={statusTone(offer.status)} withDot />
           <Badge label={formatBudget(offer.amount) ?? '—'} tone="primary" />
+          {paymentBadge(offer.job_id)}
         </View>
 
         {offer.message ? (

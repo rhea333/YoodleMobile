@@ -47,3 +47,6 @@ GoogleService-Info.plist
 # generated native folders
 /ios
 /android
+
+# Supabase CLI local state (linked project ref, version cache). Machine-specific.
+supabase/.temp/
