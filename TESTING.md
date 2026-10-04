@@ -2505,3 +2505,181 @@ Cheap to check and it confirms the query is gated correctly:
 - **No automated coverage.** C is the most automatable (it is a cache
   invalidation assertion, not a UI timing one) and the most likely to regress
   silently, since nothing about the screen looks wrong when it is stale.
+
+---
+
+## 2026-09-21 — Migrations 0018 and 0019 applied and verified
+
+**This supersedes the "not applied / not run" notes in the three sections above,
+for the database half only.** The Edge Functions remain undeployed and no app
+walkthrough has been performed.
+
+### Applied
+
+Both migrations were applied to `aovsfxypbdoppezlyjus` via the Supabase MCP
+`apply_migration`, not `supabase db push` — the CLI is not installed locally.
+They are recorded in `supabase_migrations` under their file names.
+
+Pre-flight first, because both migrations tighten a constraint and either could
+have failed on existing data:
+
+| Check | Result |
+| --- | --- |
+| jobs / offers / accepted offers | 58 / 1 / 1 |
+| payments | **0** |
+| reviews | **0** |
+| profiles with a Stripe Connect account | **0** |
+| jobs with >1 accepted offer | 0 |
+| (job, reviewer) pairs with >1 review | 0 |
+
+Nothing had ever reached Stripe — no payments, no Connect accounts — which is
+consistent with the functions never having been deployed, and means neither
+migration was tightening a rule that live data already violated.
+
+### Verified present after applying
+
+`profile_ratings` view (with `security_invoker = true` confirmed on
+`reloptions`), `offers_one_accepted_per_job`, `reviews_one_per_job_per_reviewer`,
+`reviews_insert_counterparty`, `jobs_select_accepted_worker`, and
+`app.is_accepted_worker_as`. The two objects 0018 replaces —
+`reviews_one_per_pair_per_job` and `reviews_insert_participant` — are confirmed
+**gone**, not merely shadowed.
+
+### Both constraints exercised against the live database
+
+Each test ran inside a `DO` block ending in `raise exception`, so the
+transaction unwound and nothing was left behind. The second test asserts the
+first one's cleanup (`offers_before=1`) rather than assuming it.
+
+**One accepted offer per job.** Inserted a second `accepted` offer, different
+worker, same job as the existing accepted one:
+
+```
+PASS: second accepted offer refused by unique_violation
+```
+
+**One review per job per reviewer.** Inserted a review, then a second by the
+**same reviewer on the same job against a different reviewee** — the case the
+old `(job_id, reviewer_id, reviewee_id)` constraint permitted and the new
+`(job_id, reviewer_id)` one must not:
+
+```
+PASS: second review by same reviewer refused by unique_violation
+```
+
+That second test is the one that matters, because it distinguishes the new
+constraint from the old rather than just re-confirming something 0006 already
+did.
+
+### NOT done, and why
+
+- **Edge Functions are still not deployed.** Both
+  `mcp__supabase__deploy_edge_function` and `list_edge_functions` return *"Your
+  account does not have the necessary privileges to access this endpoint."* The
+  configured access token has database access but not platform access. This is
+  the same limitation that has made `get_advisors` unavailable since phase 4 —
+  now with a known cause rather than a shrug.
+- **The Stripe secret's mode is unverified.** No MCP tool exposes Edge Function
+  secrets, and Supabase does not return a secret's value once set — the
+  dashboard shows a digest. It must be checked by a human under Edge Functions →
+  Secrets.
+- **Neither walkthrough has been run.** Both need the app on a device, a native
+  PaymentSheet, and the Stripe dashboard.
+- **The concurrent-accept test (case B in the section above) has NOT been run.**
+  What is verified here is that the *constraint* refuses a second accepted
+  offer. That the *Edge Function* converts the resulting 23505 into a clean 409
+  is still unverified, because the function is not deployed.
+
+### What a human needs to do next
+
+```
+npx supabase@latest login                     # interactive; cannot be scripted here
+npx supabase@latest link --project-ref aovsfxypbdoppezlyjus
+npx supabase@latest functions deploy stripe-connect-onboarding
+npx supabase@latest functions deploy stripe-connect-return   --no-verify-jwt
+npx supabase@latest functions deploy stripe-authorize-payment
+npx supabase@latest functions deploy stripe-release-payment
+npx supabase@latest functions deploy stripe-cancel-payment
+npx supabase@latest functions deploy stripe-webhook          --no-verify-jwt
+```
+
+`npx supabase@latest --version` reports 2.117.0 on this machine, so the CLI
+runs without a global install. Do **not** run these until the secret's mode has
+been confirmed.
+
+---
+
+## 2026-10-03 — The project was paused, restored, and came back EMPTY
+
+**This supersedes the "applied and verified" claims in the 2026-09-21 section
+above.** Those verifications were real when written. They describe a database
+that no longer exists.
+
+### What happened
+
+The Supabase free tier pauses a project after seven days without activity. The
+last activity was 2026-09-23; by 2026-10-03 the project `aovsfxypbdoppezlyjus`
+was paused, its DNS record withdrawn, and every request from the app failed.
+
+The symptom in the app was **"Something went wrong. Please try again."** — not
+the "Could not reach Yoodle" copy that was written for exactly this case. See
+the error-mapping note at the end of this section.
+
+Restoring from the dashboard brought the project back reachable **but blank**:
+
+| Check | Before (2026-09-21) | After restore |
+| --- | --- | --- |
+| `auth.users` | 10 | **0** |
+| tables in `public` | 15+ | **0** |
+| `supabase_migrations` schema | present, 20 rows | **absent** |
+| `postgis` extension | installed (0001) | **absent** |
+| `storage` / `auth` schemas | project's own | stock, empty |
+
+This is a freshly initialised Postgres, not a partial restore: a restore still
+in flight would not present clean stock `auth` tables with zero rows.
+
+### What was lost, and what was not
+
+Lost: 10 test accounts, ~58 seeded jobs, 1 offer, and any uploaded avatars or
+job photos in storage.
+
+**Not lost, and worth being precise about:** on 2026-09-21 this project had 0
+payments, 0 reviews, 0 Connect accounts and 0 completed jobs. Nothing that had
+ever touched Stripe existed, so nothing irrecoverable went with it. The schema
+is entirely in `supabase/migrations/0001`–`0019`, and test data regenerates
+from `supabase/tests/seed_test_data.sql` and `seed_browse_jobs.sql`.
+
+### Still outstanding after this
+
+- Migrations `0001`–`0019` need re-applying in order. **Not yet done.**
+- Test data needs re-seeding. **Not yet done.**
+- The **Confirm email** toggle needs re-checking. Auth config lives outside the
+  database and should have survived, but given how this restore behaved it is
+  not worth assuming.
+- The Edge Functions were never deployed, so phase 7 is unaffected — there is
+  nothing to redeploy that was not already pending.
+
+### The error message was wrong, and that is a real bug
+
+`describeError` in `src/services/auth.ts` routes to its `network` branch only
+when `status === undefined`. supabase-js does not do that: a fetch failure
+throws `AuthRetryableFetchError` with **`status = 0`**. Zero is not `undefined`,
+so every connectivity failure falls through to the `unknown` branch and reports
+as a generic app fault.
+
+The `network` branch is therefore dead code for actual network errors. Had it
+worked, the app would have said "Could not reach Yoodle" and the paused project
+would have been obvious immediately instead of looking like a sign-up bug.
+
+Fix is one condition — `status === undefined || status === 0` — and it affects
+sign-in and sign-up together, since both share `describeError`. **Not yet
+applied.**
+
+### Known gaps
+
+- **Nothing here has been re-verified against a live database**, because the
+  database is empty as of this writing. Every row in the table above is a
+  measurement of the blank project, not of a restored one.
+- **No automated guard against this recurring.** The pause will happen again
+  after seven idle days, and the only thing that would make it legible from
+  inside the app is the error-mapping fix above.
